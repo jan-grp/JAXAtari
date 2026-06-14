@@ -78,6 +78,7 @@ GAME_MODULES = {
     "mspacman": "jaxatari.games.jax_mspacman",
     "montezumarevenge": "jaxatari.games.jax_montezumarevenge",
     # "pacman": "jaxatari.games.jax_pacman",
+    "icehockey": "jaxatari.games.jax_icehockey",
     # Add new games here
 }
 
