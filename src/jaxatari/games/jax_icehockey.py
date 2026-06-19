@@ -304,7 +304,8 @@ class JaxIceHockey(JaxEnvironment):
             ),
             puck_state=PuckState(
                 position=jnp.array([c.FACEOFF_X, c.FACEOFF_Y], dtype=jnp.float32),
-                velocity=jnp.array([0.0, 0.0], dtype=jnp.float32),
+                #just a const to test it remove when finished
+                velocity=jnp.array([1.5, 2.0], dtype=jnp.float32),
                 direction=jnp.array(0, dtype=jnp.int32),
                 position_stick=jnp.array(0, dtype=jnp.int32),
             ),
@@ -340,9 +341,12 @@ class JaxIceHockey(JaxEnvironment):
             new_player_state, new_enemy_state, action, tackle_key,
         )
 
+        new_puck_state = self._puck_step(state.puck_state)
+
         state = state.replace(
             player_state=new_player_state,
             enemy_state=new_enemy_state,
+            puck_state=new_puck_state,
             counter=state.counter + 1,
             rng=rng,
         )
@@ -567,7 +571,7 @@ class JaxIceHockey(JaxEnvironment):
         dx = jnp.where(movable & right, velocity, jnp.where(movable & left, -velocity, 0.0))
         # Screen y grows downward, so DOWN increases y and UP decreases it.
         # NOTE: diagonals move by `velocity` on each axis, i.e. ~1.41x faster than a
-        # straight move.    
+        # straight move.
         dy = jnp.where(movable & down, velocity, jnp.where(movable & up, -velocity, 0.0))
 
         new_x = jnp.clip(character.position[0] + dx, bounds[0], bounds[1])
@@ -779,6 +783,29 @@ class JaxIceHockey(JaxEnvironment):
     # ------------------------------------------------------------------ #
     # Orchestrator — runs phase 1 then phase 2 for all four characters
     # ------------------------------------------------------------------ #
+    def _puck_step(self, puck: PuckState) -> PuckState:
+        c = self.consts
+        tentative = puck.position + puck.velocity
+        vel = puck.velocity
+        hit_left  = tentative[0] < c.RINK_LEFT
+        hit_right = tentative[0] > c.RINK_RIGHT
+        hit_top   = tentative[1] < c.RINK_TOP
+        hit_bot   = tentative[1] > c.RINK_BOTTOM
+
+
+        vx = jnp.where(hit_left | hit_right, -vel[0], vel[0])
+        vy = jnp.where(hit_top  | hit_bot,   -vel[1], vel[1])
+        vel = jnp.array([vx, vy], dtype=jnp.float32)
+
+        pos = jnp.clip(
+            tentative,
+            jnp.array([float(c.RINK_LEFT),  float(c.RINK_TOP)]),
+            jnp.array([float(c.RINK_RIGHT), float(c.RINK_BOTTOM)]),
+            )
+        return puck.replace(position=pos, velocity=vel)
+
+
+
     def _characters_step(
         self,
         player_state: PlayerState,
@@ -840,7 +867,7 @@ class JaxIceHockey(JaxEnvironment):
             enemy_state.skater, enemy_state.goalie,
             puck_position, enemy_state.active_character,
         )
-        
+
         # 2) Phase 1 — intended input movement, uniform over each team's two skaters.
         p1, p2 = self._apply_team_inputs(
             player_state.skater, player_state.goalie,
