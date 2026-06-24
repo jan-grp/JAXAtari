@@ -1,6 +1,6 @@
 import os
 from functools import partial
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 import jax.random as jrandom
 import jax
 import jax.numpy as jnp
@@ -177,6 +177,13 @@ class IceHockeyConstants(struct.PyTreeNode):
     STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
     PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
+    
+    # Pick up region around the end of the stick in which the puck can be picked up
+    PICKUP_BOX_W: float = struct.field(pytree_node=False, default=14.0)
+    PICKUP_BOX_H: float = struct.field(pytree_node=False, default=8.0)
+    PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=14.0)
+    PICKUP_BOX_OFFSET_X_LEFT: float = struct.field(pytree_node=False, default=0.0)
+    PICKUP_BOX_OFFSET_X_RIGHT: float = struct.field(pytree_node=False, default=18.0)
 
     # Asset manifest lives in the constants so the modding framework can apply
     # asset_overrides before the renderer is constructed.
@@ -348,7 +355,7 @@ class JaxIceHockey(JaxEnvironment):
             puck_state=PuckState(
                 position=jnp.array([c.FACEOFF_X, c.FACEOFF_Y], dtype=jnp.float32),
                 # just a const to test it remove when finished
-                velocity=jnp.array([1.5, 2.0], dtype=jnp.float32),
+                velocity=jnp.array([0, 0], dtype=jnp.float32),
                 direction=jnp.array(0, dtype=jnp.int32),
                 position_stick=jnp.array(0, dtype=jnp.int32),
             ),
@@ -377,7 +384,7 @@ class JaxIceHockey(JaxEnvironment):
             player_action=action,
             enemy_action=jnp.array(Action.NOOP, dtype=jnp.int32),
         )
-        new_player_state = self._puck_pickup(new_player_state, state.puck_state)
+        new_player_state, new_enemy_state = self._puck_pickup(new_player_state, new_enemy_state, state.puck_state)
 
         # Tackle: the player's active skater can body-check an enemy with FIRE.
         rng, tackle_key = jrandom.split(state.rng)
@@ -944,44 +951,74 @@ class JaxIceHockey(JaxEnvironment):
         dy = c.STICK_DY + 2
         sign = jnp.where(char.orientation == 1, 1.0, -1.0)  # Flip
         return center + jnp.array([sign * dx, dy], dtype=jnp.float32)
+    
+    def _check_puck_in_bounding_box(
+        self, 
+        puck_pos: chex.Array, # [x, y]
+        box_top_left_xy: chex.Array, # [x, y]
+        box_w: float, # width
+        box_h: float, # height
+    ) -> chex.Array:
+        """Check if the puck is within a bounding box defined by its top-left corner, width, and height."""
+        x_in_box = (puck_pos[0] >= box_top_left_xy[0]) & (puck_pos[0] <= box_top_left_xy[0] + box_w)
+        y_in_box = (puck_pos[1] >= box_top_left_xy[1]) & (puck_pos[1] <= box_top_left_xy[1] + box_h)
+        jax.debug.print("puck in box: {}", (x_in_box & y_in_box,))
+        return x_in_box & y_in_box
 
     def _puck_pickup(
         self,
         player_state: PlayerState,
+        enemy_state: EnemyState,
         puck_state: PuckState,
-    ) -> PlayerState:
+    ) -> tuple[PlayerState, EnemyState]:
         """Set the has_puck flag on the active character if it can grab the puck.
         The active character (skater if active_character == 0, goalie if == 1)
         picks up the puck when within range and nobody on the team already
         carries it. Returns the player state with updated has_puck flags.
         """
-        p_sk = player_state.skater
-        p_go = player_state.goalie
+        def check_character_pickup(char: CharacterState) -> chex.Array:
+            return jax.lax.cond(
+                char.orientation == 0,  # facing left
+                lambda _: self._check_puck_in_bounding_box(
+                    puck_pos,
+                    char.position + jnp.array([c.PICKUP_BOX_OFFSET_X_LEFT, c.PICKUP_BOX_OFFSET_Y]),
+                    c.PICKUP_BOX_W,
+                    c.PICKUP_BOX_H
+                ),
+                lambda _: self._check_puck_in_bounding_box(
+                    puck_pos,
+                    char.position + jnp.array([c.PICKUP_BOX_OFFSET_X_RIGHT, c.PICKUP_BOX_OFFSET_Y]),
+                    c.PICKUP_BOX_W,
+                    c.PICKUP_BOX_H,                    
+                ),
+                operand=None
+            )
+            
+        def maybe_pickup(char: CharacterState) -> CharacterState:
+            return jax.lax.cond(
+                check_character_pickup(char),
+                lambda _: char.replace(has_puck=True),
+                lambda _: char,
+                operand=None
+            )
+        c = self.consts
         puck_pos = puck_state.position
+        
+        p_sk = player_state.skater
+        p_go = player_state.goalie  
         p_active = player_state.active_character
-
-        anyone_has = p_sk.has_puck | p_go.has_puck
-
-        # Active player picks up the puck when in range, nobody else carries it,
-        # and they are not mid-swing (shooting_cooldown > 0 means the stick is busy).
-        sk_dist_sq = jnp.sum((p_sk.position - puck_pos) ** 2)
-        go_dist_sq = jnp.sum((p_go.position - puck_pos) ** 2)
-        sk_picks_up = (
-            (p_active == 0)
-            & (sk_dist_sq < 12.0**2)
-            & ~anyone_has
-            & (p_sk.shooting_cooldown == 0)
-        )
-        go_picks_up = (
-            (p_active == 1)
-            & (go_dist_sq < 12.0**2)
-            & ~anyone_has
-            & (p_go.shooting_cooldown == 0)
-        )
-        p_sk = p_sk.replace(has_puck=p_sk.has_puck | sk_picks_up)
-        p_go = p_go.replace(has_puck=p_go.has_puck | go_picks_up)
-        # ^
-        return player_state.replace(skater=p_sk, goalie=p_go)
+        p_sk = jax.lax.cond(p_active == 0, maybe_pickup, lambda _: p_sk, operand=p_sk)
+        p_go = jax.lax.cond(p_active == 1, maybe_pickup, lambda _: p_go, operand=p_go)
+        
+        e_sk = enemy_state.skater
+        e_go = enemy_state.goalie
+        e_active = enemy_state.active_character
+        e_sk = jax.lax.cond(e_active == 0, maybe_pickup, lambda _: e_sk, operand=e_sk)
+        e_go = jax.lax.cond(e_active == 1, maybe_pickup, lambda _: e_go, operand=e_go)
+        
+        new_player_state = player_state.replace(skater=p_sk, goalie=p_go)
+        new_enemy_state = enemy_state.replace(skater=e_sk, goalie=e_go)
+        return new_player_state, new_enemy_state
 
     def _puck_carry(
         self,
