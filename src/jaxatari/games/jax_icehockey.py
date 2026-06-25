@@ -838,32 +838,30 @@ class JaxIceHockey(JaxEnvironment):
         player_state: PlayerState,
         puck_state: PuckState,
     ) -> Tuple[PlayerState, PuckState]:
-        """Release the puck as a shot on the first frame of a swing.
-
-        The shot direction is the vector from the character centre to the puck's
-        current position on the stick (sign * dx, dy), normalised and scaled to
-        PUCK_SPEED.  The trigger condition is shooting_cooldown == SHOOT_ANIM_FRAMES,
-        which is only true on the exact frame FIRE was pressed with cooldown == 0.
-        """
         c = self.consts
         p_sk = player_state.skater
         p_go = player_state.goalie
-
         sk_shoots = p_sk.has_puck & (p_sk.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
         go_shoots = p_go.has_puck & (p_go.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
         should_shoot = sk_shoots | go_shoots
-
         slot = puck_state.position_stick
-        angle = slot.astype(jnp.float32) * (jnp.pi / jnp.float32(c.STICK_SLOTS))
-        shot_vel = jnp.array(
-            [jnp.cos(angle) * c.PUCK_SPEED, jnp.sin(angle) * c.PUCK_SPEED],
-            dtype=jnp.float32,
-        )
 
+        t = slot.astype(jnp.float32) / jnp.float32(c.STICK_SLOTS - 1)
+
+        phi = (t - 0.5) * jnp.pi
+
+        def shot_for(char):
+            sign = jnp.where(char.orientation == 1, 1.0, -1.0).astype(jnp.float32)
+            vx = sign * jnp.sin(phi) * c.PUCK_SPEED
+            vy = jnp.cos(phi) * c.PUCK_SPEED
+            return jnp.array([vx, vy], dtype=jnp.float32)
+
+        sk_vel = shot_for(p_sk)
+        go_vel = shot_for(p_go)
+        shot_vel = jnp.where(sk_shoots, sk_vel, go_vel)
         new_velocity = jnp.where(should_shoot, shot_vel, puck_state.velocity)
         new_sk = p_sk.replace(has_puck=p_sk.has_puck & ~sk_shoots)
         new_go = p_go.replace(has_puck=p_go.has_puck & ~go_shoots)
-
         return (
             player_state.replace(skater=new_sk, goalie=new_go),
             puck_state.replace(velocity=new_velocity),
