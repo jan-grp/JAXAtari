@@ -375,14 +375,20 @@ class JaxIceHockey(JaxEnvironment):
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: IceHockeyState, action):
+        if isinstance(action, (tuple, list)):
+            player_action, enemy_action = action
+        else:
+            player_action = action
+            enemy_action = self._enemy_policy(state)
+
         previous_state = state
 
         new_player_state, new_enemy_state = self._characters_step(
             state.player_state,
             state.enemy_state,
             state.puck_state.position,
-            player_action=action,
-            enemy_action=jnp.array(Action.NOOP, dtype=jnp.int32),
+            player_action=player_action,
+            enemy_action=enemy_action,
         )
         new_player_state, new_enemy_state = self._puck_pickup(new_player_state, new_enemy_state, state.puck_state)
 
@@ -412,6 +418,9 @@ class JaxIceHockey(JaxEnvironment):
         done = self._get_done(state)
         info = self._get_info(state)
         return obs, state, reward, done, info
+
+    def _enemy_policy(self, state: IceHockeyState) -> chex.Array:
+        return jnp.array(Action.NOOP, dtype=jnp.int32)
 
     def _decrement_tackle(self, char: CharacterState) -> CharacterState:
         """Tick a character's tackle timer down one frame; clear is_tackled at 0."""
