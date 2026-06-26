@@ -962,7 +962,6 @@ class JaxIceHockey(JaxEnvironment):
         """Check if the puck is within a bounding box defined by its top-left corner, width, and height."""
         x_in_box = (puck_pos[0] >= box_top_left_xy[0]) & (puck_pos[0] <= box_top_left_xy[0] + box_w)
         y_in_box = (puck_pos[1] >= box_top_left_xy[1]) & (puck_pos[1] <= box_top_left_xy[1] + box_h)
-        jax.debug.print("puck in box: {}", (x_in_box & y_in_box,))
         return x_in_box & y_in_box
 
     def _puck_pickup(
@@ -971,53 +970,61 @@ class JaxIceHockey(JaxEnvironment):
         enemy_state: EnemyState,
         puck_state: PuckState,
     ) -> tuple[PlayerState, EnemyState]:
-        """Set the has_puck flag on the active character if it can grab the puck.
-        The active character (skater if active_character == 0, goalie if == 1)
-        picks up the puck when within range and nobody on the team already
-        carries it. Returns the player state with updated has_puck flags.
+        """Resolve which single character (if any) holds the puck this frame.
+
+        Each team's active character grabs the puck when it lies inside that character's pickup box. A
+        grabber that does not already hold the puck is a *challenger*: challengers
+        beat the current holder, so the puck can be stolen, and they also pick up
+        a free puck. At most one character ends up with ``has_puck`` set; ties
+        between challengers are broken by a fixed priority (player skater, player
+        goalie, enemy skater, enemy goalie).
         """
-        def check_character_pickup(char: CharacterState) -> chex.Array:
-            return jax.lax.cond(
-                char.orientation == 0,  # facing left
-                lambda _: self._check_puck_in_bounding_box(
-                    puck_pos,
-                    char.position + jnp.array([c.PICKUP_BOX_OFFSET_X_LEFT, c.PICKUP_BOX_OFFSET_Y]),
-                    c.PICKUP_BOX_W,
-                    c.PICKUP_BOX_H
-                ),
-                lambda _: self._check_puck_in_bounding_box(
-                    puck_pos,
-                    char.position + jnp.array([c.PICKUP_BOX_OFFSET_X_RIGHT, c.PICKUP_BOX_OFFSET_Y]),
-                    c.PICKUP_BOX_W,
-                    c.PICKUP_BOX_H,                    
-                ),
-                operand=None
-            )
-            
-        def maybe_pickup(char: CharacterState) -> CharacterState:
-            return jax.lax.cond(
-                check_character_pickup(char),
-                lambda _: char.replace(has_puck=True),
-                lambda _: char,
-                operand=None
-            )
         c = self.consts
         puck_pos = puck_state.position
-        
-        p_sk = player_state.skater
-        p_go = player_state.goalie  
-        p_active = player_state.active_character
-        p_sk = jax.lax.cond(p_active == 0, maybe_pickup, lambda _: p_sk, operand=p_sk)
-        p_go = jax.lax.cond(p_active == 1, maybe_pickup, lambda _: p_go, operand=p_go)
-        
-        e_sk = enemy_state.skater
-        e_go = enemy_state.goalie
-        e_active = enemy_state.active_character
-        e_sk = jax.lax.cond(e_active == 0, maybe_pickup, lambda _: e_sk, operand=e_sk)
-        e_go = jax.lax.cond(e_active == 1, maybe_pickup, lambda _: e_go, operand=e_go)
-        
-        new_player_state = player_state.replace(skater=p_sk, goalie=p_go)
-        new_enemy_state = enemy_state.replace(skater=e_sk, goalie=e_go)
+
+        def in_pickup_box(char: CharacterState) -> chex.Array:
+            # Box sits in front of the character; orientation 0 faces left.
+            offset_x = jnp.where(
+                char.orientation == 0,
+                c.PICKUP_BOX_OFFSET_X_LEFT,
+                c.PICKUP_BOX_OFFSET_X_RIGHT,
+            )
+            box_top_left = char.position + jnp.array([offset_x, c.PICKUP_BOX_OFFSET_Y])
+            return self._check_puck_in_bounding_box(
+                puck_pos, box_top_left, c.PICKUP_BOX_W, c.PICKUP_BOX_H
+            )
+
+        # Fixed-priority order; index also breaks ties between challengers.
+        chars = (
+            player_state.skater,
+            player_state.goalie,
+            enemy_state.skater,
+            enemy_state.goalie,
+        )
+        is_active = jnp.array([
+            player_state.active_character == 0,
+            player_state.active_character == 1,
+            enemy_state.active_character == 0,
+            enemy_state.active_character == 1,
+        ])
+        in_box = jnp.array([in_pickup_box(char) for char in chars])
+        holds = jnp.array([char.has_puck for char in chars])
+
+        grab = is_active & in_box          # only the active character can grab
+        challenger = grab & ~holds         # a new grab beats the current holder
+        # Challengers (score 2) outrank a passive holder (score 1); 0 = free puck.
+        score = challenger.astype(jnp.int32) * 2 + holds.astype(jnp.int32)
+        winner = jnp.argmax(score)         # first max wins -> priority by index
+        new_has_puck = (jnp.arange(4) == winner) & (jnp.max(score) > 0)
+
+        new_player_state = player_state.replace(
+            skater=player_state.skater.replace(has_puck=new_has_puck[0]),
+            goalie=player_state.goalie.replace(has_puck=new_has_puck[1]),
+        )
+        new_enemy_state = enemy_state.replace(
+            skater=enemy_state.skater.replace(has_puck=new_has_puck[2]),
+            goalie=enemy_state.goalie.replace(has_puck=new_has_puck[3]),
+        )
         return new_player_state, new_enemy_state
 
     def _puck_carry(
