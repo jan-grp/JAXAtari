@@ -179,8 +179,8 @@ class IceHockeyConstants(struct.PyTreeNode):
     PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
     
     # Pick up region around the end of the stick in which the puck can be picked up
-    PICKUP_BOX_W: float = struct.field(pytree_node=False, default=14.0)
-    PICKUP_BOX_H: float = struct.field(pytree_node=False, default=8.0)
+    PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
+    PICKUP_BOX_H: float = struct.field(pytree_node=False, default=4.0)
     PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=14.0)
     PICKUP_BOX_OFFSET_X_LEFT: float = struct.field(pytree_node=False, default=0.0)
     PICKUP_BOX_OFFSET_X_RIGHT: float = struct.field(pytree_node=False, default=18.0)
