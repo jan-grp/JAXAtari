@@ -8,8 +8,10 @@ Two modes:
   python test.py --out frame.png --scale 6
 
   # 2. Interactive — open a pygame window and drive the game by hand.
-  #    Arrow keys move, Space = FIRE, R = reset, Esc/Q = quit.
+  #    Arrow keys move player, Space = player FIRE, R = reset, Esc/Q = quit.
+  #    With --keyboard-enemy: WASD moves enemy, Left Shift = enemy FIRE.
   python test.py --play
+  python test.py --play --keyboard-enemy
 
 Run with --cpu to force JAX onto the CPU (handy if a GPU is busy/absent).
 """
@@ -69,17 +71,12 @@ def snapshot(out_path: str, scale: int) -> None:
         print(f"Pillow not installed; saved raw array to {npy_path} instead.")
 
 
-KEY_TO_ACTION = {
-    # populated inside play() once pygame is imported
-}
-
-
-def get_action(pygame, keys):
-    up = keys[pygame.K_UP]
-    down = keys[pygame.K_DOWN]
-    left = keys[pygame.K_LEFT]
-    right = keys[pygame.K_RIGHT]
-    fire = keys[pygame.K_SPACE]
+def get_action(pygame, keys, up_key, down_key, left_key, right_key, fire_key):
+    up = keys[up_key]
+    down = keys[down_key]
+    left = keys[left_key]
+    right = keys[right_key]
+    fire = keys[fire_key]
 
     if up and right:
         return Action.UPRIGHTFIRE if fire else Action.UPRIGHT
@@ -102,7 +99,7 @@ def get_action(pygame, keys):
     return Action.NOOP
 
 
-def play(scale: int) -> None:
+def play(scale: int, keyboard_enemy: bool) -> None:
     import pygame
 
     env = JaxIceHockey()
@@ -115,7 +112,10 @@ def play(scale: int) -> None:
 
     pygame.init()
     screen = pygame.display.set_mode((w * scale, h * scale))
-    pygame.display.set_caption("jax_icehockey render test — arrows move, space fire, R reset")
+    caption = "jax_icehockey render test - arrows/space player, R reset"
+    if keyboard_enemy:
+        caption += ", WASD/left-shift enemy"
+    pygame.display.set_caption(caption)
     clock = pygame.time.Clock()
 
     running = True
@@ -129,8 +129,30 @@ def play(scale: int) -> None:
                 elif event.key == pygame.K_r:
                     _obs, state = reset_fn(jrandom.PRNGKey(0))
 
-        action = get_action(pygame, pygame.key.get_pressed())
-        step_out = step_fn(state, action)
+        keys = pygame.key.get_pressed()
+        action = get_action(
+            pygame,
+            keys,
+            pygame.K_UP,
+            pygame.K_DOWN,
+            pygame.K_LEFT,
+            pygame.K_RIGHT,
+            pygame.K_SPACE,
+        )
+        step_action = action
+        if keyboard_enemy:
+            enemy_action = get_action(
+                pygame,
+                keys,
+                pygame.K_w,
+                pygame.K_s,
+                pygame.K_a,
+                pygame.K_d,
+                pygame.K_LSHIFT,
+            )
+            step_action = (action, enemy_action)
+
+        step_out = step_fn(state, step_action)
         state = step_out[1]  # (obs, state, reward, done, info)
 
         img = to_uint8_image(render_fn(state))
@@ -150,10 +172,15 @@ def main() -> None:
     parser.add_argument("--out", default="icehockey_frame.png", help="snapshot output path")
     parser.add_argument("--scale", type=int, default=UPSCALE, help="upscale factor")
     parser.add_argument("--cpu", action="store_true", help="force JAX onto CPU")
+    parser.add_argument(
+        "--keyboard-enemy",
+        action="store_true",
+        help="control the enemy with WASD and left shift instead of the NPC controller",
+    )
     args = parser.parse_args()
 
     if args.play:
-        play(args.scale)
+        play(args.scale, args.keyboard_enemy)
     else:
         snapshot(args.out, args.scale)
 
