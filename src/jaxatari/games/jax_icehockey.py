@@ -1,12 +1,11 @@
 import os
 from functools import partial
 from typing import Tuple, Optional
-
+import jax.random as jrandom
 import jax
 import jax.numpy as jnp
 import chex
 from flax import struct
-
 import jaxatari.rendering.jax_rendering_utils as render_utils
 import jaxatari.spaces as spaces
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action, ObjectObservation
@@ -129,7 +128,21 @@ class IceHockeyConstants(struct.PyTreeNode):
     MIN_SEPARATION: float = struct.field(pytree_node=False, default=8.0)
     MIN_VERTICAL_DISTANCE: float = struct.field(pytree_node=False, default=40.0)
 
-    # 3 min * 60 s * 60 fps = 10800 raw frames.
+    # Tackle (body-check): the active skater can knock an opponent down by pushing
+    # toward them while swinging. A successful hit freezes the victim for a random
+    # number of frames (the downed sprite shows for that time).
+    # PLACEHOLDER values to verify against the ROM (via RAMStateDeltas):
+    #   - range: how close (pixels, centre-to-centre) the victim must be.
+    #   - prob: success chance per SWING (while in range AND pushing toward the
+    #     victim; 0.333 = easy to test).
+    #   - min/max frames: stun duration in game frames (= step() calls), drawn
+    #     uniformly in [min, max]. Calibrate against ROM frames at frameskip=1
+    #     (playback rate like play.py's 30 fps does NOT change frame counts).
+    TACKLE_RANGE: float = struct.field(pytree_node=False, default=18.0)
+    TACKLE_SUCCESS_PROB: float = struct.field(pytree_node=False, default=0.33333)
+    TACKLE_FRAMES_MIN: int = struct.field(pytree_node=False, default=60)
+    TACKLE_FRAMES_MAX: int = struct.field(pytree_node=False, default=120)
+
     TIME_LIMIT: int = struct.field(pytree_node=False, default=10800)
     FACE_OFF_FRAMES: int = struct.field(pytree_node=False, default=40)
 
@@ -171,6 +184,7 @@ class CharacterState:
     has_puck: chex.Array
     shooting_cooldown: chex.Array
     walk_counter: chex.Array    # leg walk-cycle phase counter (advances while moving)
+    tackle_timer: chex.Array    # frames left while tackled; is_tackled == (tackle_timer > 0)
 
 
 @struct.dataclass
@@ -202,6 +216,7 @@ class IceHockeyState:
     puck_state: PuckState
     counter: chex.Array
     game_state: GameState
+    rng: chex.PRNGKey           # split each step for stochastic events (e.g. tackles)
 
 
 @struct.dataclass
@@ -269,10 +284,11 @@ class JaxIceHockey(JaxEnvironment):
             return CharacterState(
                 is_tackled=jnp.array(False),
                 position=jnp.array([x, y], dtype=jnp.float32),
-                orientation=jnp.array(orientation, dtype=jnp.int32),
+                orientation=jnp.array(0, dtype=jnp.int32),
                 has_puck=jnp.array(False),
                 shooting_cooldown=jnp.array(0, dtype=jnp.int32),
                 walk_counter=jnp.array(0, dtype=jnp.int32),
+                tackle_timer=jnp.array(0, dtype=jnp.int32),
             )
 
         state = IceHockeyState(
@@ -293,6 +309,7 @@ class JaxIceHockey(JaxEnvironment):
                 position_stick=jnp.array(0, dtype=jnp.int32),
             ),
             counter=jnp.array(0, dtype=jnp.int32),
+            rng=key if key is not None else jrandom.PRNGKey(0),
             game_state=GameState(
                 pause_counter=jnp.array(c.FACE_OFF_FRAMES, dtype=jnp.int32),
                 player_score=jnp.array(0, dtype=jnp.int32),
@@ -316,10 +333,18 @@ class JaxIceHockey(JaxEnvironment):
             player_action=action,
             enemy_action=jnp.array(Action.NOOP, dtype=jnp.int32),
         )
+
+        # Tackle: the player's active skater can body-check an enemy with FIRE.
+        rng, tackle_key = jrandom.split(state.rng)
+        new_player_state, new_enemy_state = self._tackle_step(
+            new_player_state, new_enemy_state, action, tackle_key,
+        )
+
         state = state.replace(
             player_state=new_player_state,
             enemy_state=new_enemy_state,
             counter=state.counter + 1,
+            rng=rng,
         )
 
         obs = self._get_observation(state)
@@ -327,6 +352,137 @@ class JaxIceHockey(JaxEnvironment):
         done = self._get_done(state)
         info = self._get_info(state)
         return obs, state, reward, done, info
+
+    def _decrement_tackle(self, char: CharacterState) -> CharacterState:
+        """Tick a character's tackle timer down one frame; clear is_tackled at 0."""
+        new_timer = jnp.maximum(char.tackle_timer - 1, 0)
+        return char.replace(tackle_timer=new_timer, is_tackled=new_timer > 0)
+
+    def _goalie_protected(self, goalie_pos: chex.Array, goal_y: chex.Array) -> chex.Array:
+        """True when a goalie is too close to its own goal line to be tackled."""
+        c = self.consts
+        # Protected if within the crease band of its goal line, and horizontally
+        # within the goal mouth (plus a small margin).
+        near_line = jnp.abs(goalie_pos[1] - goal_y) <= (c.GOALIE_CREASE_DEPTH + c.PLAYER_H)
+        in_mouth = (goalie_pos[0] >= c.GOAL_X0 - c.PLAYER_W) & (goalie_pos[0] <= c.GOAL_X1)
+        return near_line & in_mouth
+
+    def _tackle_step(
+            self,
+            player_state: PlayerState,
+            enemy_state: EnemyState,
+            player_action: chex.Array,
+            key: chex.PRNGKey,
+    ) -> Tuple[PlayerState, EnemyState]:
+        """Resolve the player's body-check against the enemy team for one frame.
+
+        The player's ACTIVE skater, on a FIRE press, knocks down the nearest
+        eligible enemy if within TACKLE_RANGE and a random roll succeeds. The enemy
+        goalie is immune while in its crease. Then every character's tackle timer
+        is ticked down (which also clears is_tackled when it expires).
+
+        Pushing a downed character is unaffected here: that is handled positionally
+        in _separate_opponents and is intentionally left enabled.
+        """
+        c = self.consts
+
+        # The player's tackler is whichever player character is active (closest to puck).
+        attacker = jax.lax.cond(
+            player_state.active_character == 0,
+            lambda: player_state.skater,
+            lambda: player_state.goalie,
+        )
+        attacker_pos = attacker.position
+
+        # One tackle attempt PER SWING. _characters_step has already run this frame,
+        # so a swing just started exactly when the attacker's shooting_cooldown was
+        # (re)set to its max. Holding FIRE replays the swing every SHOOT_ANIM_FRAMES,
+        # so each swing is one attempt.
+        swing_started = attacker.shooting_cooldown == self.consts.SHOOT_ANIM_FRAMES
+
+        # Intended movement direction from this frame's action (mirrors _apply_action):
+        # the tackle only lands when the attacker is pushing TOWARD the victim, not when
+        # standing still or skating away.
+        a = player_action
+        move_right = jnp.any(jnp.array([
+            a == Action.RIGHT, a == Action.UPRIGHT, a == Action.DOWNRIGHT,
+            a == Action.RIGHTFIRE, a == Action.UPRIGHTFIRE, a == Action.DOWNRIGHTFIRE,
+        ]))
+        move_left = jnp.any(jnp.array([
+            a == Action.LEFT, a == Action.UPLEFT, a == Action.DOWNLEFT,
+            a == Action.LEFTFIRE, a == Action.UPLEFTFIRE, a == Action.DOWNLEFTFIRE,
+        ]))
+        move_down = jnp.any(jnp.array([
+            a == Action.DOWN, a == Action.DOWNRIGHT, a == Action.DOWNLEFT,
+            a == Action.DOWNFIRE, a == Action.DOWNRIGHTFIRE, a == Action.DOWNLEFTFIRE,
+        ]))
+        move_up = jnp.any(jnp.array([
+            a == Action.UP, a == Action.UPRIGHT, a == Action.UPLEFT,
+            a == Action.UPFIRE, a == Action.UPRIGHTFIRE, a == Action.UPLEFTFIRE,
+        ]))
+        move_dx = jnp.where(move_right, 1.0, jnp.where(move_left, -1.0, 0.0))
+        move_dy = jnp.where(move_down, 1.0, jnp.where(move_up, -1.0, 0.0))
+        moving = (move_dx != 0.0) | (move_dy != 0.0)
+
+        # Distance (centre-to-centre, matching the collision model) to each enemy.
+        d_skater = jnp.sum((enemy_state.skater.position - attacker_pos) ** 2)
+        d_goalie = jnp.sum((enemy_state.goalie.position - attacker_pos) ** 2)
+        range_sq = c.TACKLE_RANGE ** 2
+
+        # Enemy goalie is immune while guarding its goal (enemy defends the BOTTOM).
+        goalie_safe = self._goalie_protected(
+            enemy_state.goalie.position, jnp.float32(c.ENEMY_GOAL_Y)
+        )
+
+        # A target is hittable if in range, not already tackled, and (for the goalie)
+        # not protected.
+        skater_hittable = (d_skater <= range_sq) & jnp.logical_not(enemy_state.skater.is_tackled)
+        goalie_hittable = (
+                (d_goalie <= range_sq)
+                & jnp.logical_not(enemy_state.goalie.is_tackled)
+                & jnp.logical_not(goalie_safe)
+        )
+
+        # Pick the closer eligible target (prefer the skater on a tie).
+        target_is_skater = skater_hittable & ((d_skater <= d_goalie) | jnp.logical_not(goalie_hittable))
+        target_is_goalie = goalie_hittable & jnp.logical_not(target_is_skater)
+        any_target = target_is_skater | target_is_goalie
+
+        # Vector from attacker to the chosen target, and whether movement points at it.
+        target_pos = jnp.where(target_is_skater, enemy_state.skater.position, enemy_state.goalie.position)
+        to_target = target_pos - attacker_pos
+        # Positive dot product => moving toward the target (pushing into them).
+        moving_toward = moving & ((move_dx * to_target[0] + move_dy * to_target[1]) > 0.0)
+
+        # One roll per swing (see swing_started above).
+        roll = jrandom.uniform(key)
+        success = swing_started & any_target & moving_toward & (roll < c.TACKLE_SUCCESS_PROB)
+
+        # Random stun duration in [TACKLE_FRAMES_MIN, TACKLE_FRAMES_MAX].
+        dur = jrandom.randint(
+            key, shape=(), minval=c.TACKLE_FRAMES_MIN, maxval=c.TACKLE_FRAMES_MAX + 1
+        )
+
+        def knock_down(char: CharacterState) -> CharacterState:
+            return char.replace(tackle_timer=dur, is_tackled=jnp.array(True))
+
+        new_enemy_skater = jax.lax.cond(
+            success & target_is_skater, knock_down, lambda ch: ch, enemy_state.skater
+        )
+        new_enemy_goalie = jax.lax.cond(
+            success & target_is_goalie, knock_down, lambda ch: ch, enemy_state.goalie
+        )
+
+        # Tick all four timers down by one frame (clears is_tackled on expiry).
+        new_player_state = player_state.replace(
+            skater=self._decrement_tackle(player_state.skater),
+            goalie=self._decrement_tackle(player_state.goalie),
+        )
+        new_enemy_state = enemy_state.replace(
+            skater=self._decrement_tackle(new_enemy_skater),
+            goalie=self._decrement_tackle(new_enemy_goalie),
+        )
+        return new_player_state, new_enemy_state
 
     def _resolve_active_character(
         self,
