@@ -96,6 +96,7 @@ class IceHockeyConstants(struct.PyTreeNode):
     # 3 min * 60 s * 60 fps = 10800 raw frames.
     TIME_LIMIT: int = struct.field(pytree_node=False, default=10800)
     FACE_OFF_FRAMES: int = struct.field(pytree_node=False, default=40)
+    NUM_PERIODS: int = struct.field(pytree_node=False, default=3)
 
     # Face-off layout. [x, y] = [col, row].
     FACEOFF_X: float = struct.field(pytree_node=False, default=79.0)
@@ -125,6 +126,7 @@ class GameState:
     is_faceoff: chex.Array
     goal_scored: chex.Array
     is_finished: chex.Array
+    period: chex.Array           
 
 
 @struct.dataclass
@@ -224,9 +226,7 @@ class JaxIceHockey(JaxEnvironment):
     def image_space(self) -> spaces.Box:
         return spaces.Box(low=0, high=255, shape=(210, 160, 3), dtype=jnp.uint8)
 
-    @partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey = None) -> Tuple:
-        # Face-off: puck at centre, characters on start positions
+    def _initial_state(self) -> IceHockeyState:
         c = self.consts
 
         def char(x, y, orientation=0):
@@ -239,9 +239,9 @@ class JaxIceHockey(JaxEnvironment):
                 walk_counter=jnp.array(0, dtype=jnp.int32),
             )
 
-        state = IceHockeyState(
+        return IceHockeyState(
             player_state=PlayerState(
-                skater=char(c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1), # oriented right at start
+                skater=char(c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1),
                 goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y),
                 active_character=jnp.array(0, dtype=jnp.int32),
             ),
@@ -265,25 +265,86 @@ class JaxIceHockey(JaxEnvironment):
                 is_faceoff=jnp.array(True),
                 goal_scored=jnp.array(False),
                 is_finished=jnp.array(False),
+                period=jnp.array(1, dtype=jnp.int32),
             ),
         )
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, key: chex.PRNGKey = None) -> Tuple:
+        state = self._initial_state()
         return self._get_observation(state), state
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: IceHockeyState, action):
         previous_state = state
+        c = self.consts
 
-        new_player_state, new_enemy_state = self._characters_step(
-            state.player_state,
-            state.enemy_state,
-            state.puck_state.position,
-            player_action=action,
-            enemy_action=jnp.array(Action.NOOP, dtype=jnp.int32),
+        # Freeze players when the game ends
+        new_player_state, new_enemy_state = jax.lax.cond(
+            state.game_state.is_finished,
+            lambda: (state.player_state, state.enemy_state),
+            lambda: self._characters_step(
+                state.player_state,
+                state.enemy_state,
+                state.puck_state.position,
+                player_action=action,
+                enemy_action=jnp.array(Action.NOOP, dtype=jnp.int32),
+            ),
         )
-        state = state.replace(
+
+        # Faceoff countdown: pause_counter counts down to 0, then the game starts.
+        new_pause_counter = jnp.where(
+            state.game_state.is_faceoff,
+            jnp.maximum(state.game_state.pause_counter - 1, 0),
+            state.game_state.pause_counter,
+        )
+        new_is_faceoff = state.game_state.is_faceoff & (new_pause_counter > 0)
+
+        # Clock runs only during active play (not during faceoffs)
+        new_remaining_time = jnp.where(
+            new_is_faceoff,
+            state.game_state.remaining_time,
+            jnp.maximum(state.game_state.remaining_time - 1, 0),
+        )
+
+        # Period end: when time runs out , next period or game over
+        period_over = ~new_is_faceoff & (new_remaining_time <= 0)
+        next_period = state.game_state.period + 1
+        game_over = period_over & (next_period > c.NUM_PERIODS)
+
+        # At period end: reset timer + faceoff for next period
+        new_remaining_time = jnp.where(
+            period_over & ~game_over,
+            jnp.int32(c.TIME_LIMIT),
+            new_remaining_time,
+        )
+        new_is_faceoff = new_is_faceoff | (period_over & ~game_over)
+        new_pause_counter = jnp.where(
+            period_over & ~game_over,
+            jnp.int32(c.FACE_OFF_FRAMES),
+            new_pause_counter,
+        )
+        new_period = jnp.where(period_over, next_period, state.game_state.period)
+
+        new_game_state = state.game_state.replace(
+            pause_counter=new_pause_counter,
+            is_faceoff=new_is_faceoff,
+            remaining_time=new_remaining_time,
+            is_finished=game_over,
+            period=jnp.minimum(new_period, jnp.int32(c.NUM_PERIODS)),
+        )
+        new_state = state.replace(
             player_state=new_player_state,
             enemy_state=new_enemy_state,
             counter=state.counter + 1,
+            game_state=new_game_state,
+        )
+
+        # After the 3rd period: automatic reset
+        state = jax.lax.cond(
+            game_over,
+            lambda: self._initial_state(),
+            lambda: new_state,
         )
 
         obs = self._get_observation(state)
@@ -838,5 +899,14 @@ class IceHockeyRenderer(JAXGameRenderer):
         # Blue (player) score on the left, gold (enemy) on the right, as in the ROM.
         raster = draw_score(raster, state.game_state.player_score, 43, 33, dm_blue)
         raster = draw_score(raster, state.game_state.enemy_score, 113, 103, dm_gold)
+
+        # Clock (MM:SS) 
+        total_secs = (state.game_state.remaining_time + 59) // 60
+        clock_min = total_secs // 60
+        clock_sec = total_secs % 60
+        min_digits = self.jr.int_to_digits(clock_min, max_digits=2)
+        sec_digits = self.jr.int_to_digits(clock_sec, max_digits=2)
+        raster = self.jr.render_label_selective(raster, 67, 3, min_digits, dm_blue, 0, 2, spacing=7, max_digits_to_render=2)
+        raster = self.jr.render_label_selective(raster, 81, 3, sec_digits, dm_blue, 0, 2, spacing=7, max_digits_to_render=2)
 
         return self.jr.render_from_palette(raster, self.PALETTE)
