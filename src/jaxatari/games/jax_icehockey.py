@@ -2,12 +2,10 @@ import os
 from functools import partial
 from typing import Tuple, Optional
 import jax.random as jrandom
-
 import jax
 import jax.numpy as jnp
 import chex
 from flax import struct
-
 import jaxatari.rendering.jax_rendering_utils as render_utils
 import jaxatari.spaces as spaces
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action, ObjectObservation
