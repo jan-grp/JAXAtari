@@ -468,10 +468,10 @@ class JaxIceHockey(JaxEnvironment):
         )
 
         new_puck_state = self._puck_carry(
-            new_player_state, state.puck_state, state.counter
+            new_player_state, new_enemy_state, state.puck_state, state.counter
         )
-        new_player_state, new_puck_state = self._puck_shoot(
-            new_player_state, new_puck_state
+        new_player_state, new_enemy_state, new_puck_state = self._puck_shoot(
+            new_player_state, new_enemy_state, new_puck_state
         )
 
         state = state.replace(
@@ -1059,23 +1059,15 @@ class JaxIceHockey(JaxEnvironment):
         )  # Dreieck 0..n-1..0 0-30 und dann von 30-0
         return slot.astype(jnp.int32)
 
-    def _carried_puck_pos(self, char: CharacterState, slot: chex.Array) -> chex.Array:
-        """Puck position while carried: pinned just in front of the character.
-
-        Computed from the box CENTRE so a left/right flip is a clean mirror
-        across the box's vertical centre line. dx/dy are authored for a
-        right-facing character; `sign` mirrors them for a left-facing one.
-        """
+    def _carried_puck_pos(self, char, slot, dy_sign: float = 1.0):
         c = self.consts
         center = char.position + jnp.array(
             [c.PLAYER_W / 2.0, c.PLAYER_H / 2.0], dtype=jnp.float32
         )
-        # spiegelung ist nicht gleicn wie beim sprite FLIP_OFFSET player anschauen!!!!
         t = slot.astype(jnp.float32) / (c.STICK_SLOTS)
-        sign = jnp.where(char.orientation == 1, 1.0, -1.0)  # rechts +, links -
+        sign = jnp.where(char.orientation == 1, 1.0, -1.0)
         dx = c.STICK_MIN_DX + t * (c.STICK_MAX_DX - c.STICK_MIN_DX)
-        dy = c.STICK_DY + 2
-        sign = jnp.where(char.orientation == 1, 1.0, -1.0)  # Flip
+        dy = dy_sign * (c.STICK_DY + 2)
         return center + jnp.array([sign * dx, dy], dtype=jnp.float32)
 
     def _check_puck_in_bounding_box(
@@ -1162,70 +1154,83 @@ class JaxIceHockey(JaxEnvironment):
     def _puck_carry(
         self,
         player_state: PlayerState,
+        enemy_state: EnemyState,
         puck_state: PuckState,
         counter: chex.Array,
     ) -> PuckState:
-        """Advance the puck: pinned to the carrier, or free physics if uncarried.
-        When a player character holds the puck it sits just in front of the
-        carrier (see `_carried_puck_pos`) and its velocity is zeroed; otherwise
-        `_puck_step` advances it. Expects has_puck flags already resolved
-        (see `_puck_pickup`).
-        """
-        p_sk = player_state.skater
-        p_go = player_state.goalie
-        anyone_has = p_sk.has_puck | p_go.has_puck
+        p_sk, p_go = player_state.skater, player_state.goalie
+        e_sk, e_go = enemy_state.skater, enemy_state.goalie
+        anyone_has = p_sk.has_puck | p_go.has_puck | e_sk.has_puck | e_go.has_puck
 
         slot = self._stick_slot(counter)
+
         carry_pos = jnp.where(
             p_sk.has_puck,
-            self._carried_puck_pos(p_sk, slot),
-            self._carried_puck_pos(p_go, slot),
+            self._carried_puck_pos(p_sk, slot, dy_sign=1.0),
+            jnp.where(
+                p_go.has_puck,
+                self._carried_puck_pos(p_go, slot, dy_sign=1.0),
+                jnp.where(
+                    e_sk.has_puck,
+                    self._carried_puck_pos(e_sk, slot, dy_sign=1.0)
+                    - jnp.array([0.0, 2.0]),
+                    self._carried_puck_pos(e_go, slot, dy_sign=1.0)
+                    - jnp.array([0.0, 2.0]),
+                ),
+            ),
         )
-        # Puck physics only runs when nobody carries it.
         free_puck = self._puck_step(puck_state)
         new_puck_pos = jnp.where(anyone_has, carry_pos, free_puck.position)
         new_puck_vel = jnp.where(
-            anyone_has,
-            jnp.zeros(2, dtype=jnp.float32),
-            free_puck.velocity,
+            anyone_has, jnp.zeros(2, dtype=jnp.float32), free_puck.velocity
         )
         return puck_state.replace(
-            position=new_puck_pos,
-            velocity=new_puck_vel,
-            position_stick=slot,
+            position=new_puck_pos, velocity=new_puck_vel, position_stick=slot
         )
 
-    def _puck_shoot(
-        self,
-        player_state: PlayerState,
-        puck_state: PuckState,
-    ) -> Tuple[PlayerState, PuckState]:
+    def _puck_shoot(self, player_state, enemy_state, puck_state):
         c = self.consts
-        p_sk = player_state.skater
-        p_go = player_state.goalie
+        p_sk, p_go = player_state.skater, player_state.goalie
+        e_sk, e_go = enemy_state.skater, enemy_state.goalie
         sk_shoots = p_sk.has_puck & (p_sk.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
         go_shoots = p_go.has_puck & (p_go.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
-        should_shoot = sk_shoots | go_shoots
+        e_sk_shoots = e_sk.has_puck & (e_sk.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
+        e_go_shoots = e_go.has_puck & (e_go.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
+        should_shoot = sk_shoots | go_shoots | e_sk_shoots | e_go_shoots
+
         slot = puck_state.position_stick
-
         t = slot.astype(jnp.float32) / jnp.float32(c.STICK_SLOTS - 1)
-
         phi = (t - 0.5) * jnp.pi
 
-        def shot_for(char):
+        def shot_for(char, team_sign):
             sign = jnp.where(char.orientation == 1, 1.0, -1.0).astype(jnp.float32)
             vx = sign * jnp.sin(phi) * c.PUCK_SPEED
-            vy = jnp.cos(phi) * c.PUCK_SPEED
+            vy = (
+                team_sign * jnp.cos(phi) * c.PUCK_SPEED
+            )  # Player +1 (runter), Enemy -1 (hoch)
             return jnp.array([vx, vy], dtype=jnp.float32)
 
-        sk_vel = shot_for(p_sk)
-        go_vel = shot_for(p_go)
-        shot_vel = jnp.where(sk_shoots, sk_vel, go_vel)
+        shot_vel = jnp.where(
+            sk_shoots,
+            shot_for(p_sk, 1.0),
+            jnp.where(
+                go_shoots,
+                shot_for(p_go, 1.0),
+                jnp.where(e_sk_shoots, shot_for(e_sk, -1.0), shot_for(e_go, -1.0)),
+            ),
+        )
         new_velocity = jnp.where(should_shoot, shot_vel, puck_state.velocity)
-        new_sk = p_sk.replace(has_puck=p_sk.has_puck & ~sk_shoots)
-        new_go = p_go.replace(has_puck=p_go.has_puck & ~go_shoots)
+        new_player_state = player_state.replace(
+            skater=p_sk.replace(has_puck=p_sk.has_puck & ~sk_shoots),
+            goalie=p_go.replace(has_puck=p_go.has_puck & ~go_shoots),
+        )
+        new_enemy_state = enemy_state.replace(
+            skater=e_sk.replace(has_puck=e_sk.has_puck & ~e_sk_shoots),
+            goalie=e_go.replace(has_puck=e_go.has_puck & ~e_go_shoots),
+        )
         return (
-            player_state.replace(skater=new_sk, goalie=new_go),
+            new_player_state,
+            new_enemy_state,
             puck_state.replace(velocity=new_velocity),
         )
 
