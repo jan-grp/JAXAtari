@@ -1,12 +1,11 @@
 import os
 from functools import partial
 from typing import Tuple, Optional, Union
-
+import jax.random as jrandom
 import jax
 import jax.numpy as jnp
 import chex
 from flax import struct
-
 import jaxatari.rendering.jax_rendering_utils as render_utils
 import jaxatari.spaces as spaces
 from jaxatari.environment import (
@@ -24,28 +23,121 @@ def _get_default_asset_config() -> tuple:
     """
     return (
         {"name": "background", "type": "background", "file": "background.npy"},
-        # Skater sprites per team, authored facing right (the renderer mirrors them
-        # for left-facing skaters). Per character the renderer picks:
-        #   - "<team>" walk-cycle frames (with stick) when the ACTIVE skater moves,
-        #   - "<team>_idle" (with stick) when the active skater stands still,
-        #   - "<team>_nostick" for the INACTIVE teammate (drawn without a stick).
-        {"name": "player", "type": "group", "files": ["player_0.npy", "player_1.npy"]},
-        {"name": "enemy", "type": "group", "files": ["enemy_0.npy", "enemy_1.npy"]},
-        {"name": "player_idle", "type": "single", "file": "player_idle.npy"},
-        {"name": "enemy_idle", "type": "single", "file": "enemy_idle.npy"},
-        {"name": "player_nostick", "type": "single", "file": "player_nostick.npy"},
-        {"name": "enemy_nostick", "type": "single", "file": "enemy_nostick.npy"},
-        # "<team>_shoot" = the active skater's 2-frame swing animation (wind-up ->
-        # follow-through), played while shooting_cooldown > 0.
         {
-            "name": "player_shoot",
+            "name": "player_walking_left",
             "type": "group",
-            "files": ["player_shoot_0.npy", "player_shoot_1.npy"],
+            "files": [
+                "player_walking_left_0.npy",
+                "player_walking_left_1.npy",
+                "player_walking_left_2.npy",
+                "player_walking_left_3.npy",
+            ],
         },
         {
-            "name": "enemy_shoot",
+            "name": "player_walking_right",
             "type": "group",
-            "files": ["enemy_shoot_0.npy", "enemy_shoot_1.npy"],
+            "files": [
+                "player_walking_right_0.npy",
+                "player_walking_right_1.npy",
+                "player_walking_right_2.npy",
+                "player_walking_right_3.npy",
+            ],
+        },
+        {
+            "name": "enemy_walking_left",
+            "type": "group",
+            "files": [
+                "enemy_walking_left_0.npy",
+                "enemy_walking_left_1.npy",
+                "enemy_walking_left_2.npy",
+                "enemy_walking_left_3.npy",
+            ],
+        },
+        {
+            "name": "enemy_walking_right",
+            "type": "group",
+            "files": [
+                "enemy_walking_right_0.npy",
+                "enemy_walking_right_1.npy",
+                "enemy_walking_right_2.npy",
+                "enemy_walking_right_3.npy",
+            ],
+        },
+        {"name": "player_idle_left", "type": "single", "file": "player_idle_left.npy"},
+        {
+            "name": "player_idle_right",
+            "type": "single",
+            "file": "player_idle_right.npy",
+        },
+        {"name": "enemy_idle_left", "type": "single", "file": "enemy_idle_left.npy"},
+        {"name": "enemy_idle_right", "type": "single", "file": "enemy_idle_right.npy"},
+        {
+            "name": "player_active_standing_left",
+            "type": "single",
+            "file": "player_active_standing_left.npy",
+        },
+        {
+            "name": "player_active_standing_right",
+            "type": "single",
+            "file": "player_active_standing_right.npy",
+        },
+        {
+            "name": "enemy_active_standing_left",
+            "type": "single",
+            "file": "enemy_active_standing_left.npy",
+        },
+        {
+            "name": "enemy_active_standing_right",
+            "type": "single",
+            "file": "enemy_active_standing_right.npy",
+        },
+        {"name": "player_faceoff", "type": "single", "file": "player_faceoff.npy"},
+        {"name": "enemy_faceoff", "type": "single", "file": "enemy_faceoff.npy"},
+        {"name": "player_tackled", "type": "single", "file": "player_tackled.npy"},
+        {"name": "enemy_tackled", "type": "single", "file": "enemy_tackled.npy"},
+        {
+            "name": "player_shooting_right",
+            "type": "group",
+            "files": [
+                "player_shooting_right_0.npy",
+                "player_shooting_right_1.npy",
+                "player_shooting_right_2.npy",
+                "player_shooting_right_3.npy",
+                "player_shooting_right_4.npy",
+            ],
+        },
+        {
+            "name": "player_shooting_left",
+            "type": "group",
+            "files": [
+                "player_shooting_left_0.npy",
+                "player_shooting_left_1.npy",
+                "player_shooting_left_2.npy",
+                "player_shooting_left_3.npy",
+                "player_shooting_left_4.npy",
+            ],
+        },
+        {
+            "name": "enemy_shooting_right",
+            "type": "group",
+            "files": [
+                "enemy_shooting_right_0.npy",
+                "enemy_shooting_right_1.npy",
+                "enemy_shooting_right_2.npy",
+                "enemy_shooting_right_3.npy",
+                "enemy_shooting_right_4.npy",
+            ],
+        },
+        {
+            "name": "enemy_shooting_left",
+            "type": "group",
+            "files": [
+                "enemy_shooting_left_0.npy",
+                "enemy_shooting_left_1.npy",
+                "enemy_shooting_left_2.npy",
+                "enemy_shooting_left_3.npy",
+                "enemy_shooting_left_4.npy",
+            ],
         },
         {"name": "puck", "type": "single", "file": "puck.npy"},
         {
@@ -78,7 +170,7 @@ class IceHockeyConstants(struct.PyTreeNode):
 
     # Sprite sizes, used for observation bounding boxes
     PLAYER_W: int = struct.field(pytree_node=False, default=26)
-    PLAYER_H: int = struct.field(pytree_node=False, default=20)
+    PLAYER_H: int = struct.field(pytree_node=False, default=26)
     PUCK_W: int = struct.field(pytree_node=False, default=2)
     PUCK_H: int = struct.field(pytree_node=False, default=2)
 
@@ -87,11 +179,10 @@ class IceHockeyConstants(struct.PyTreeNode):
     # Skater leg walk-cycle: number of frames in the loop and how many game
     # frames each phase is shown for. The cycle advances only while a skater has
     # directional input.
-    ANIM_FRAMES: int = struct.field(pytree_node=False, default=2)
     ANIM_CADENCE: int = struct.field(pytree_node=False, default=4)
 
-    # Shooting/swing animation: how many game frames the active skater holds the
-    # swing (wind-up) pose after a FIRE press. Drives shooting_cooldown.
+    # Shooting/swing animation: 5 frames at ANIM_CADENCE frames each.
+    # Drives shooting_cooldown.
     SHOOT_ANIM_FRAMES: int = struct.field(pytree_node=False, default=8)
 
     # Offset from the goal lines defining zone where goalie/skater can't move.
@@ -105,7 +196,21 @@ class IceHockeyConstants(struct.PyTreeNode):
     MIN_SEPARATION: float = struct.field(pytree_node=False, default=8.0)
     MIN_VERTICAL_DISTANCE: float = struct.field(pytree_node=False, default=40.0)
 
-    # 3 min * 60 s * 60 fps = 10800 raw frames.
+    # Tackle (body-check): the active skater can knock an opponent down by pushing
+    # toward them while swinging. A successful hit freezes the victim for a random
+    # number of frames (the downed sprite shows for that time).
+    # PLACEHOLDER values to verify against the ROM (via RAMStateDeltas):
+    #   - range: how close (pixels, centre-to-centre) the victim must be.
+    #   - prob: success chance per SWING (while in range AND pushing toward the
+    #     victim; 0.333 = easy to test).
+    #   - min/max frames: stun duration in game frames (= step() calls), drawn
+    #     uniformly in [min, max]. Calibrate against ROM frames at frameskip=1
+    #     (playback rate like play.py's 30 fps does NOT change frame counts).
+    TACKLE_RANGE: float = struct.field(pytree_node=False, default=18.0)
+    TACKLE_SUCCESS_PROB: float = struct.field(pytree_node=False, default=0.33333)
+    TACKLE_FRAMES_MIN: int = struct.field(pytree_node=False, default=60)
+    TACKLE_FRAMES_MAX: int = struct.field(pytree_node=False, default=120)
+
     TIME_LIMIT: int = struct.field(pytree_node=False, default=10800)
     FACE_OFF_FRAMES: int = struct.field(pytree_node=False, default=40)
 
@@ -132,7 +237,7 @@ class IceHockeyConstants(struct.PyTreeNode):
     STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
     PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
-    
+
     # Pick up region around the end of the stick in which the puck can be picked up
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
     PICKUP_BOX_H: float = struct.field(pytree_node=False, default=4.0)
@@ -166,6 +271,9 @@ class CharacterState:
     has_puck: chex.Array
     shooting_cooldown: chex.Array
     walk_counter: chex.Array  # leg walk-cycle phase counter (advances while moving)
+    tackle_timer: (
+        chex.Array
+    )  # frames left while tackled; is_tackled == (tackle_timer > 0)
 
 
 @struct.dataclass
@@ -197,6 +305,7 @@ class IceHockeyState:
     puck_state: PuckState
     counter: chex.Array
     game_state: GameState
+    rng: chex.PRNGKey  # split each step for stochastic events (e.g. tackles)
 
 
 @struct.dataclass
@@ -283,27 +392,26 @@ class JaxIceHockey(JaxEnvironment):
         # Face-off: puck at centre, characters on start positions
         c = self.consts
 
-        def char(x, y, orientation=0):
+        def char(x, y, orientation):
             return CharacterState(
                 is_tackled=jnp.array(False),
                 position=jnp.array([x, y], dtype=jnp.float32),
-                orientation=jnp.array(orientation, dtype=jnp.int32),
+                orientation=jnp.array(0, dtype=jnp.int32),
                 has_puck=jnp.array(False),
                 shooting_cooldown=jnp.array(0, dtype=jnp.int32),
                 walk_counter=jnp.array(0, dtype=jnp.int32),
+                tackle_timer=jnp.array(0, dtype=jnp.int32),
             )
 
         state = IceHockeyState(
             player_state=PlayerState(
-                skater=char(
-                    c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1
-                ),  # oriented right at start
-                goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y),
+                skater=char(c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1),
+                goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y, orientation=0),
                 active_character=jnp.array(0, dtype=jnp.int32),
             ),
             enemy_state=EnemyState(
-                skater=char(c.ENEMY_SKATER_X, c.ENEMY_SKATER_Y),
-                goalie=char(c.ENEMY_GOALIE_X, c.ENEMY_GOALIE_Y),
+                skater=char(c.ENEMY_SKATER_X, c.ENEMY_SKATER_Y, orientation=0),
+                goalie=char(c.ENEMY_GOALIE_X, c.ENEMY_GOALIE_Y, orientation=0),
                 active_character=jnp.array(0, dtype=jnp.int32),
             ),
             puck_state=PuckState(
@@ -314,12 +422,15 @@ class JaxIceHockey(JaxEnvironment):
                 position_stick=jnp.array(0, dtype=jnp.int32),
             ),
             counter=jnp.array(0, dtype=jnp.int32),
+            rng=key if key is not None else jrandom.PRNGKey(0),
             game_state=GameState(
                 pause_counter=jnp.array(c.FACE_OFF_FRAMES, dtype=jnp.int32),
                 player_score=jnp.array(0, dtype=jnp.int32),
                 enemy_score=jnp.array(0, dtype=jnp.int32),
                 remaining_time=jnp.array(c.TIME_LIMIT, dtype=jnp.int32),
-                is_faceoff=jnp.array(True),
+                is_faceoff=jnp.array(
+                    False
+                ),  # False, until face off is properly implemented
                 goal_scored=jnp.array(False),
                 is_finished=jnp.array(False),
             ),
@@ -343,7 +454,19 @@ class JaxIceHockey(JaxEnvironment):
             player_action=player_action,
             enemy_action=enemy_action,
         )
-        new_player_state, new_enemy_state = self._puck_pickup(new_player_state, new_enemy_state, state.puck_state)
+        new_player_state, new_enemy_state = self._puck_pickup(
+            new_player_state, new_enemy_state, state.puck_state
+        )
+
+        # Tackle: the player's active skater can body-check an enemy with FIRE.
+        rng, tackle_key = jrandom.split(state.rng)
+        new_player_state, new_enemy_state = self._tackle_step(
+            new_player_state,
+            new_enemy_state,
+            action,
+            tackle_key,
+        )
+
         new_puck_state = self._puck_carry(
             new_player_state, state.puck_state, state.counter
         )
@@ -356,6 +479,7 @@ class JaxIceHockey(JaxEnvironment):
             enemy_state=new_enemy_state,
             puck_state=new_puck_state,
             counter=state.counter + 1,
+            rng=rng,
         )
 
         obs = self._get_observation(state)
@@ -366,6 +490,185 @@ class JaxIceHockey(JaxEnvironment):
 
     def _enemy_policy(self, state: IceHockeyState) -> chex.Array:
         return jnp.array(Action.NOOP, dtype=jnp.int32)
+
+    def _decrement_tackle(self, char: CharacterState) -> CharacterState:
+        """Tick a character's tackle timer down one frame; clear is_tackled at 0."""
+        new_timer = jnp.maximum(char.tackle_timer - 1, 0)
+        return char.replace(tackle_timer=new_timer, is_tackled=new_timer > 0)
+
+    def _goalie_protected(
+        self, goalie_pos: chex.Array, goal_y: chex.Array
+    ) -> chex.Array:
+        """True when a goalie is too close to its own goal line to be tackled."""
+        c = self.consts
+        # Protected if within the crease band of its goal line, and horizontally
+        # within the goal mouth (plus a small margin).
+        near_line = jnp.abs(goalie_pos[1] - goal_y) <= (
+            c.GOALIE_CREASE_DEPTH + c.PLAYER_H
+        )
+        in_mouth = (goalie_pos[0] >= c.GOAL_X0 - c.PLAYER_W) & (
+            goalie_pos[0] <= c.GOAL_X1
+        )
+        return near_line & in_mouth
+
+    def _tackle_step(
+        self,
+        player_state: PlayerState,
+        enemy_state: EnemyState,
+        player_action: chex.Array,
+        key: chex.PRNGKey,
+    ) -> Tuple[PlayerState, EnemyState]:
+        """Resolve the player's body-check against the enemy team for one frame.
+
+        The player's ACTIVE skater, on a FIRE press, knocks down the nearest
+        eligible enemy if within TACKLE_RANGE and a random roll succeeds. The enemy
+        goalie is immune while in its crease. Then every character's tackle timer
+        is ticked down (which also clears is_tackled when it expires).
+
+        Pushing a downed character is unaffected here: that is handled positionally
+        in _separate_opponents and is intentionally left enabled.
+        """
+        c = self.consts
+
+        # The player's tackler is whichever player character is active (closest to puck).
+        attacker = jax.lax.cond(
+            player_state.active_character == 0,
+            lambda: player_state.skater,
+            lambda: player_state.goalie,
+        )
+        attacker_pos = attacker.position
+
+        # One tackle attempt PER SWING. _characters_step has already run this frame,
+        # so a swing just started exactly when the attacker's shooting_cooldown was
+        # (re)set to its max. Holding FIRE replays the swing every SHOOT_ANIM_FRAMES,
+        # so each swing is one attempt.
+        swing_started = attacker.shooting_cooldown == self.consts.SHOOT_ANIM_FRAMES
+
+        # Intended movement direction from this frame's action (mirrors _apply_action):
+        # the tackle only lands when the attacker is pushing TOWARD the victim, not when
+        # standing still or skating away.
+        a = player_action
+        move_right = jnp.any(
+            jnp.array(
+                [
+                    a == Action.RIGHT,
+                    a == Action.UPRIGHT,
+                    a == Action.DOWNRIGHT,
+                    a == Action.RIGHTFIRE,
+                    a == Action.UPRIGHTFIRE,
+                    a == Action.DOWNRIGHTFIRE,
+                ]
+            )
+        )
+        move_left = jnp.any(
+            jnp.array(
+                [
+                    a == Action.LEFT,
+                    a == Action.UPLEFT,
+                    a == Action.DOWNLEFT,
+                    a == Action.LEFTFIRE,
+                    a == Action.UPLEFTFIRE,
+                    a == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        move_down = jnp.any(
+            jnp.array(
+                [
+                    a == Action.DOWN,
+                    a == Action.DOWNRIGHT,
+                    a == Action.DOWNLEFT,
+                    a == Action.DOWNFIRE,
+                    a == Action.DOWNRIGHTFIRE,
+                    a == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        move_up = jnp.any(
+            jnp.array(
+                [
+                    a == Action.UP,
+                    a == Action.UPRIGHT,
+                    a == Action.UPLEFT,
+                    a == Action.UPFIRE,
+                    a == Action.UPRIGHTFIRE,
+                    a == Action.UPLEFTFIRE,
+                ]
+            )
+        )
+        move_dx = jnp.where(move_right, 1.0, jnp.where(move_left, -1.0, 0.0))
+        move_dy = jnp.where(move_down, 1.0, jnp.where(move_up, -1.0, 0.0))
+        moving = (move_dx != 0.0) | (move_dy != 0.0)
+
+        # Distance (centre-to-centre, matching the collision model) to each enemy.
+        d_skater = jnp.sum((enemy_state.skater.position - attacker_pos) ** 2)
+        d_goalie = jnp.sum((enemy_state.goalie.position - attacker_pos) ** 2)
+        range_sq = c.TACKLE_RANGE**2
+
+        # Enemy goalie is immune while guarding its goal (enemy defends the BOTTOM).
+        goalie_safe = self._goalie_protected(
+            enemy_state.goalie.position, jnp.float32(c.ENEMY_GOAL_Y)
+        )
+
+        # A target is hittable if in range, not already tackled, and (for the goalie)
+        # not protected.
+        skater_hittable = (d_skater <= range_sq) & jnp.logical_not(
+            enemy_state.skater.is_tackled
+        )
+        goalie_hittable = (
+            (d_goalie <= range_sq)
+            & jnp.logical_not(enemy_state.goalie.is_tackled)
+            & jnp.logical_not(goalie_safe)
+        )
+
+        # Pick the closer eligible target (prefer the skater on a tie).
+        target_is_skater = skater_hittable & (
+            (d_skater <= d_goalie) | jnp.logical_not(goalie_hittable)
+        )
+        target_is_goalie = goalie_hittable & jnp.logical_not(target_is_skater)
+        any_target = target_is_skater | target_is_goalie
+
+        # Vector from attacker to the chosen target, and whether movement points at it.
+        target_pos = jnp.where(
+            target_is_skater, enemy_state.skater.position, enemy_state.goalie.position
+        )
+        to_target = target_pos - attacker_pos
+        # Positive dot product => moving toward the target (pushing into them).
+        moving_toward = moving & (
+            (move_dx * to_target[0] + move_dy * to_target[1]) > 0.0
+        )
+
+        # One roll per swing (see swing_started above).
+        roll = jrandom.uniform(key)
+        success = (
+            swing_started & any_target & moving_toward & (roll < c.TACKLE_SUCCESS_PROB)
+        )
+
+        # Random stun duration in [TACKLE_FRAMES_MIN, TACKLE_FRAMES_MAX].
+        dur = jrandom.randint(
+            key, shape=(), minval=c.TACKLE_FRAMES_MIN, maxval=c.TACKLE_FRAMES_MAX + 1
+        )
+
+        def knock_down(char: CharacterState) -> CharacterState:
+            return char.replace(tackle_timer=dur, is_tackled=jnp.array(True))
+
+        new_enemy_skater = jax.lax.cond(
+            success & target_is_skater, knock_down, lambda ch: ch, enemy_state.skater
+        )
+        new_enemy_goalie = jax.lax.cond(
+            success & target_is_goalie, knock_down, lambda ch: ch, enemy_state.goalie
+        )
+
+        # Tick all four timers down by one frame (clears is_tackled on expiry).
+        new_player_state = player_state.replace(
+            skater=self._decrement_tackle(player_state.skater),
+            goalie=self._decrement_tackle(player_state.goalie),
+        )
+        new_enemy_state = enemy_state.replace(
+            skater=self._decrement_tackle(new_enemy_skater),
+            goalie=self._decrement_tackle(new_enemy_goalie),
+        )
+        return new_player_state, new_enemy_state
 
     def _resolve_active_character(
         self,
@@ -774,17 +1077,21 @@ class JaxIceHockey(JaxEnvironment):
         dy = c.STICK_DY + 2
         sign = jnp.where(char.orientation == 1, 1.0, -1.0)  # Flip
         return center + jnp.array([sign * dx, dy], dtype=jnp.float32)
-    
+
     def _check_puck_in_bounding_box(
-        self, 
-        puck_pos: chex.Array, # [x, y]
-        box_top_left_xy: chex.Array, # [x, y]
-        box_w: float, # width
-        box_h: float, # height
+        self,
+        puck_pos: chex.Array,  # [x, y]
+        box_top_left_xy: chex.Array,  # [x, y]
+        box_w: float,  # width
+        box_h: float,  # height
     ) -> chex.Array:
         """Check if the puck is within a bounding box defined by its top-left corner, width, and height."""
-        x_in_box = (puck_pos[0] >= box_top_left_xy[0]) & (puck_pos[0] <= box_top_left_xy[0] + box_w)
-        y_in_box = (puck_pos[1] >= box_top_left_xy[1]) & (puck_pos[1] <= box_top_left_xy[1] + box_h)
+        x_in_box = (puck_pos[0] >= box_top_left_xy[0]) & (
+            puck_pos[0] <= box_top_left_xy[0] + box_w
+        )
+        y_in_box = (puck_pos[1] >= box_top_left_xy[1]) & (
+            puck_pos[1] <= box_top_left_xy[1] + box_h
+        )
         return x_in_box & y_in_box
 
     def _puck_pickup(
@@ -824,20 +1131,22 @@ class JaxIceHockey(JaxEnvironment):
             enemy_state.skater,
             enemy_state.goalie,
         )
-        is_active = jnp.array([
-            player_state.active_character == 0,
-            player_state.active_character == 1,
-            enemy_state.active_character == 0,
-            enemy_state.active_character == 1,
-        ])
+        is_active = jnp.array(
+            [
+                player_state.active_character == 0,
+                player_state.active_character == 1,
+                enemy_state.active_character == 0,
+                enemy_state.active_character == 1,
+            ]
+        )
         in_box = jnp.array([in_pickup_box(char) for char in chars])
         holds = jnp.array([char.has_puck for char in chars])
 
-        grab = is_active & in_box          # only the active character can grab
-        challenger = grab & ~holds         # a new grab beats the current holder
+        grab = is_active & in_box  # only the active character can grab
+        challenger = grab & ~holds  # a new grab beats the current holder
         # Challengers (score 2) outrank a passive holder (score 1); 0 = free puck.
         score = challenger.astype(jnp.int32) * 2 + holds.astype(jnp.int32)
-        winner = jnp.argmax(score)         # first max wins -> priority by index
+        winner = jnp.argmax(score)  # first max wins -> priority by index
         new_has_puck = (jnp.arange(4) == winner) & (jnp.max(score) > 0)
 
         new_player_state = player_state.replace(
@@ -1149,23 +1458,28 @@ class IceHockeyRenderer(JAXGameRenderer):
 
         puck_m = self.SHAPE_MASKS["puck"]
 
-        # Skater sprites (all authored facing right; left-facing chars, orientation
-        # 0, are mirrored). Per character the renderer picks one of three poses:
-        #   - inactive teammate              -> "<team>_nostick" (no stick),
-        #   - active skater standing still   -> "<team>_idle"    (with stick),
-        #   - active skater moving           -> "<team>" walk-cycle frame.
-        pm = self.SHAPE_MASKS["player"]
-        em = self.SHAPE_MASKS["enemy"]
-        p_idle = self.SHAPE_MASKS["player_idle"]
-        e_idle = self.SHAPE_MASKS["enemy_idle"]
-        p_nostick = self.SHAPE_MASKS["player_nostick"]
-        e_nostick = self.SHAPE_MASKS["enemy_nostick"]
-        p_shoot = self.SHAPE_MASKS["player_shoot"]
-        e_shoot = self.SHAPE_MASKS["enemy_shoot"]
-        p_off = self.FLIP_OFFSETS["player"]
-        e_off = self.FLIP_OFFSETS["enemy"]
+        # Skater sprites. Player and enemy walking/standing/idle/shooting poses
+        p_walk_l = self.SHAPE_MASKS["player_walking_left"]
+        p_walk_r = self.SHAPE_MASKS["player_walking_right"]
+        e_walk_l = self.SHAPE_MASKS["enemy_walking_left"]
+        e_walk_r = self.SHAPE_MASKS["enemy_walking_right"]
+        p_idle_l = self.SHAPE_MASKS["player_idle_left"]
+        p_idle_r = self.SHAPE_MASKS["player_idle_right"]
+        e_idle_l = self.SHAPE_MASKS["enemy_idle_left"]
+        e_idle_r = self.SHAPE_MASKS["enemy_idle_right"]
+        p_stand_l = self.SHAPE_MASKS["player_active_standing_left"]
+        p_stand_r = self.SHAPE_MASKS["player_active_standing_right"]
+        e_stand_l = self.SHAPE_MASKS["enemy_active_standing_left"]
+        e_stand_r = self.SHAPE_MASKS["enemy_active_standing_right"]
+        p_faceoff = self.SHAPE_MASKS["player_faceoff"]
+        e_faceoff = self.SHAPE_MASKS["enemy_faceoff"]
+        p_tackled = self.SHAPE_MASKS["player_tackled"]
+        e_tackled = self.SHAPE_MASKS["enemy_tackled"]
+        p_shoot_l = self.SHAPE_MASKS["player_shooting_left"]
+        p_shoot_r = self.SHAPE_MASKS["player_shooting_right"]
+        e_shoot_l = self.SHAPE_MASKS["enemy_shooting_left"]
+        e_shoot_r = self.SHAPE_MASKS["enemy_shooting_right"]
         cadence = self.consts.ANIM_CADENCE
-        nframes = self.consts.ANIM_FRAMES
 
         def col(pos):
             return jnp.round(pos[0]).astype(jnp.int32)
@@ -1173,33 +1487,154 @@ class IceHockeyRenderer(JAXGameRenderer):
         def row(pos):
             return jnp.round(pos[1]).astype(jnp.int32)
 
-        def draw(
-            r, char, move_masks, idle_mask, nostick_mask, shoot_masks, off, is_active
-        ):
-            flip = char.orientation == 0  # 0 = left; sprites face right
-            frame = (char.walk_counter // cadence) % nframes
+        def draw_oriented(r, char, left_mask, right_mask):
+            return jax.lax.cond(
+                char.orientation == 0,
+                lambda rr: self.jr.render_at_clipped(
+                    rr,
+                    col(char.position),
+                    row(char.position),
+                    left_mask,
+                ),
+                lambda rr: self.jr.render_at_clipped(
+                    rr,
+                    col(char.position),
+                    row(char.position),
+                    right_mask,
+                ),
+                r,
+            )
+
+        def draw_oriented_frame(r, char, left_masks, right_masks, frame):
+            return jax.lax.cond(
+                char.orientation == 0,
+                lambda rr: self.jr.render_at_clipped(
+                    rr,
+                    col(char.position),
+                    row(char.position),
+                    left_masks[frame],
+                ),
+                lambda rr: self.jr.render_at_clipped(
+                    rr,
+                    col(char.position),
+                    row(char.position),
+                    right_masks[frame],
+                ),
+                r,
+            )
+
+        def draw_player_shooting(r, char, shoot_frame):
+            return jax.lax.cond(
+                char.orientation == 0,
+                lambda rr: self.jr.render_at_clipped(
+                    rr,
+                    col(char.position),
+                    row(char.position),
+                    p_shoot_l[shoot_frame],
+                ),
+                lambda rr: self.jr.render_at_clipped(
+                    rr,
+                    col(char.position),
+                    row(char.position),
+                    p_shoot_r[shoot_frame],
+                ),
+                r,
+            )
+
+        def draw_player(r, char, is_active):
+            frame = (char.walk_counter // cadence) % p_walk_l.shape[0]
             moving = char.walk_counter > 0
             shooting = char.shooting_cooldown > 0
-            # Swing animation advances over the cooldown: wind-up (frame 0) then
-            # follow-through (frame 1). Count elapsed frames up from the press.
             elapsed = self.consts.SHOOT_ANIM_FRAMES - char.shooting_cooldown
-            shoot_frame = (elapsed // cadence) % shoot_masks.shape[0]
-            # active skater: swing animation while shooting, else walk frame while
-            # moving, else idle pose when still.
-            active_mask = jnp.where(
-                shooting,
-                shoot_masks[shoot_frame],
-                jnp.where(moving, move_masks[frame], idle_mask),
+            shoot_frame = (elapsed // cadence) % p_shoot_l.shape[0]
+
+            def draw_active(rr):
+                return jax.lax.cond(
+                    shooting,
+                    lambda rrr: draw_player_shooting(rrr, char, shoot_frame),
+                    lambda rrr: jax.lax.cond(
+                        moving,
+                        lambda rrrr: draw_oriented_frame(
+                            rrrr, char, p_walk_l, p_walk_r, frame
+                        ),
+                        lambda rrrr: draw_oriented(rrrr, char, p_stand_l, p_stand_r),
+                        rrr,
+                    ),
+                    rr,
+                )
+
+            return jax.lax.cond(
+                is_active,
+                draw_active,
+                lambda rr: draw_oriented(rr, char, p_idle_l, p_idle_r),
+                r,
             )
-            # inactive teammate: the stickless pose.
-            mask = jnp.where(is_active, active_mask, nostick_mask)
+
+        def draw_enemy(r, char, is_active):
+            frame = (char.walk_counter // cadence) % e_walk_l.shape[0]
+            moving = char.walk_counter > 0
+            shooting = char.shooting_cooldown > 0
+            elapsed = self.consts.SHOOT_ANIM_FRAMES - char.shooting_cooldown
+            shoot_frame = (elapsed // cadence) % e_shoot_l.shape[0]
+
+            def draw_active(rr):
+                return jax.lax.cond(
+                    shooting,
+                    lambda rrr: draw_oriented_frame(
+                        rrr,
+                        char,
+                        e_shoot_l,
+                        e_shoot_r,
+                        shoot_frame,
+                    ),
+                    lambda rrr: jax.lax.cond(
+                        moving,
+                        lambda rrrr: draw_oriented_frame(
+                            rrrr, char, e_walk_l, e_walk_r, frame
+                        ),
+                        lambda rrrr: draw_oriented(rrrr, char, e_stand_l, e_stand_r),
+                        rrr,
+                    ),
+                    rr,
+                )
+
+            return jax.lax.cond(
+                is_active,
+                draw_active,
+                lambda rr: draw_oriented(rr, char, e_idle_l, e_idle_r),
+                r,
+            )
+
+        def draw_faceoff(r, char, mask):
             return self.jr.render_at_clipped(
                 r,
                 col(char.position),
                 row(char.position),
                 mask,
-                flip_horizontal=flip,
-                flip_offset=off,
+            )
+
+        def draw_tackled(r, char, mask):
+            return self.jr.render_at_clipped(
+                r,
+                col(char.position),
+                row(char.position),
+                mask,
+            )
+
+        def draw_player_with_tackle(r, char, is_active):
+            return jax.lax.cond(
+                char.is_tackled,
+                lambda rr: draw_tackled(rr, char, p_tackled),
+                lambda rr: draw_player(rr, char, is_active),
+                r,
+            )
+
+        def draw_enemy_with_tackle(r, char, is_active):
+            return jax.lax.cond(
+                char.is_tackled,
+                lambda rr: draw_tackled(rr, char, e_tackled),
+                lambda rr: draw_enemy(rr, char, is_active),
+                r,
             )
 
         # Active character of each team (0 = skater controlled, 1 = goalie).
@@ -1208,45 +1643,29 @@ class IceHockeyRenderer(JAXGameRenderer):
 
         # render_at_clipped because skaters can reach the board pixels at the
         # edge; render_at would slice out of bounds there.
-        raster = draw(
+        raster = draw_player_with_tackle(raster, state.player_state.goalie, p_act == 1)
+        raster = draw_enemy_with_tackle(raster, state.enemy_state.goalie, e_act == 1)
+        raster = jax.lax.cond(
+            state.player_state.skater.is_tackled,
+            lambda r: draw_tackled(r, state.player_state.skater, p_tackled),
+            lambda r: jax.lax.cond(
+                state.game_state.is_faceoff,
+                lambda rr: draw_faceoff(rr, state.player_state.skater, p_faceoff),
+                lambda rr: draw_player(rr, state.player_state.skater, p_act == 0),
+                r,
+            ),
             raster,
-            state.player_state.goalie,
-            pm,
-            p_idle,
-            p_nostick,
-            p_shoot,
-            p_off,
-            p_act == 1,
         )
-        raster = draw(
+        raster = jax.lax.cond(
+            state.enemy_state.skater.is_tackled,
+            lambda r: draw_tackled(r, state.enemy_state.skater, e_tackled),
+            lambda r: jax.lax.cond(
+                state.game_state.is_faceoff,
+                lambda rr: draw_faceoff(rr, state.enemy_state.skater, e_faceoff),
+                lambda rr: draw_enemy(rr, state.enemy_state.skater, e_act == 0),
+                r,
+            ),
             raster,
-            state.enemy_state.goalie,
-            em,
-            e_idle,
-            e_nostick,
-            e_shoot,
-            e_off,
-            e_act == 1,
-        )
-        raster = draw(
-            raster,
-            state.player_state.skater,
-            pm,
-            p_idle,
-            p_nostick,
-            p_shoot,
-            p_off,
-            p_act == 0,
-        )
-        raster = draw(
-            raster,
-            state.enemy_state.skater,
-            em,
-            e_idle,
-            e_nostick,
-            e_shoot,
-            e_off,
-            e_act == 0,
         )
         raster = self.jr.render_at_clipped(
             raster,
