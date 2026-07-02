@@ -236,12 +236,19 @@ class IceHockeyConstants(struct.PyTreeNode):
     # feste Höhe — bewegt sich NICHT mit.
     STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
+    ENEMY_STICK_DY: float = struct.field(pytree_node=False, default=8.0)
+
     PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
 
     # Pick up region around the end of the stick in which the puck can be picked up
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
     PICKUP_BOX_H: float = struct.field(pytree_node=False, default=4.0)
     PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=14.0)
+
+    PLAYER_PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=14.0)
+
+    ENEMY_PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=26.0)
+
     PICKUP_BOX_OFFSET_X_LEFT: float = struct.field(pytree_node=False, default=0.0)
     PICKUP_BOX_OFFSET_X_RIGHT: float = struct.field(pytree_node=False, default=18.0)
 
@@ -1059,7 +1066,7 @@ class JaxIceHockey(JaxEnvironment):
         )  # Dreieck 0..n-1..0 0-30 und dann von 30-0
         return slot.astype(jnp.int32)
 
-    def _carried_puck_pos(self, char, slot, dy_sign: float = 1.0):
+    def _carried_puck_pos(self, char, slot, stick_dy):
         c = self.consts
         center = char.position + jnp.array(
             [c.PLAYER_W / 2.0, c.PLAYER_H / 2.0], dtype=jnp.float32
@@ -1067,8 +1074,7 @@ class JaxIceHockey(JaxEnvironment):
         t = slot.astype(jnp.float32) / (c.STICK_SLOTS)
         sign = jnp.where(char.orientation == 1, 1.0, -1.0)
         dx = c.STICK_MIN_DX + t * (c.STICK_MAX_DX - c.STICK_MIN_DX)
-        dy = dy_sign * (c.STICK_DY + 2)
-        return center + jnp.array([sign * dx, dy], dtype=jnp.float32)
+        return center + jnp.array([sign * dx, stick_dy], dtype=jnp.float32)
 
     def _check_puck_in_bounding_box(
         self,
@@ -1092,36 +1098,34 @@ class JaxIceHockey(JaxEnvironment):
         enemy_state: EnemyState,
         puck_state: PuckState,
     ) -> tuple[PlayerState, EnemyState]:
-        """Resolve which single character (if any) holds the puck this frame.
 
-        Each team's active character grabs the puck when it lies inside that character's pickup box. A
-        grabber that does not already hold the puck is a *challenger*: challengers
-        beat the current holder, so the puck can be stolen, and they also pick up
-        a free puck. At most one character ends up with ``has_puck`` set; ties
-        between challengers are broken by a fixed priority (player skater, player
-        goalie, enemy skater, enemy goalie).
-        """
         c = self.consts
         puck_pos = puck_state.position
 
-        def in_pickup_box(char: CharacterState) -> chex.Array:
-            # Box sits in front of the character; orientation 0 faces left.
+        def in_pickup_box(char: CharacterState, offset_y) -> chex.Array:
+
             offset_x = jnp.where(
                 char.orientation == 0,
                 c.PICKUP_BOX_OFFSET_X_LEFT,
                 c.PICKUP_BOX_OFFSET_X_RIGHT,
             )
-            box_top_left = char.position + jnp.array([offset_x, c.PICKUP_BOX_OFFSET_Y])
+            box_top_left = char.position + jnp.array([offset_x, offset_y])
             return self._check_puck_in_bounding_box(
                 puck_pos, box_top_left, c.PICKUP_BOX_W, c.PICKUP_BOX_H
             )
 
-        # Fixed-priority order; index also breaks ties between challengers.
         chars = (
             player_state.skater,
             player_state.goalie,
             enemy_state.skater,
             enemy_state.goalie,
+        )
+
+        offsets = (
+            c.PLAYER_PICKUP_BOX_OFFSET_Y,
+            c.PLAYER_PICKUP_BOX_OFFSET_Y,
+            c.ENEMY_PICKUP_BOX_OFFSET_Y,
+            c.ENEMY_PICKUP_BOX_OFFSET_Y,
         )
         is_active = jnp.array(
             [
@@ -1131,14 +1135,15 @@ class JaxIceHockey(JaxEnvironment):
                 enemy_state.active_character == 1,
             ]
         )
-        in_box = jnp.array([in_pickup_box(char) for char in chars])
+        in_box = jnp.array(
+            [in_pickup_box(char, offset_y) for char, offset_y in zip(chars, offsets)]
+        )
         holds = jnp.array([char.has_puck for char in chars])
 
-        grab = is_active & in_box  # only the active character can grab
-        challenger = grab & ~holds  # a new grab beats the current holder
-        # Challengers (score 2) outrank a passive holder (score 1); 0 = free puck.
+        grab = is_active & in_box
+        challenger = grab & ~holds
         score = challenger.astype(jnp.int32) * 2 + holds.astype(jnp.int32)
-        winner = jnp.argmax(score)  # first max wins -> priority by index
+        winner = jnp.argmax(score)
         new_has_puck = (jnp.arange(4) == winner) & (jnp.max(score) > 0)
 
         new_player_state = player_state.replace(
@@ -1158,6 +1163,7 @@ class JaxIceHockey(JaxEnvironment):
         puck_state: PuckState,
         counter: chex.Array,
     ) -> PuckState:
+        c = self.consts
         p_sk, p_go = player_state.skater, player_state.goalie
         e_sk, e_go = enemy_state.skater, enemy_state.goalie
         anyone_has = p_sk.has_puck | p_go.has_puck | e_sk.has_puck | e_go.has_puck
@@ -1166,19 +1172,18 @@ class JaxIceHockey(JaxEnvironment):
 
         carry_pos = jnp.where(
             p_sk.has_puck,
-            self._carried_puck_pos(p_sk, slot, dy_sign=1.0),
+            self._carried_puck_pos(p_sk, slot, stick_dy=c.STICK_DY + 2.0),
             jnp.where(
                 p_go.has_puck,
-                self._carried_puck_pos(p_go, slot, dy_sign=1.0),
+                self._carried_puck_pos(p_go, slot, stick_dy=c.STICK_DY + 2.0),
                 jnp.where(
                     e_sk.has_puck,
-                    self._carried_puck_pos(e_sk, slot, dy_sign=1.0)
-                    - jnp.array([0.0, 2.0]),
-                    self._carried_puck_pos(e_go, slot, dy_sign=1.0)
-                    - jnp.array([0.0, 2.0]),
+                    self._carried_puck_pos(e_sk, slot, stick_dy=c.ENEMY_STICK_DY),
+                    self._carried_puck_pos(e_go, slot, stick_dy=c.ENEMY_STICK_DY),
                 ),
             ),
         )
+
         free_puck = self._puck_step(puck_state)
         new_puck_pos = jnp.where(anyone_has, carry_pos, free_puck.position)
         new_puck_vel = jnp.where(
