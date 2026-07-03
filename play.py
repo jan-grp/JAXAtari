@@ -6,12 +6,13 @@ Two modes:
   #    Resets the env, renders one frame, writes it to a PNG (upscaled).
   python test.py
   python test.py --out frame.png --scale 6
+  python test.py --debug
 
   # 2. Interactive — open a pygame window and drive the game by hand.
   #    Arrow keys move player, Space = player FIRE, R = reset, Esc/Q = quit.
   #    With --keyboard-enemy: WASD moves enemy, Left Shift = enemy FIRE.
   python test.py --play
-  python test.py --play --keyboard-enemy
+  python test.py --play --keyboard-enemy --debug
 
 Run with --cpu to force JAX onto the CPU (handy if a GPU is busy/absent).
 """
@@ -30,7 +31,7 @@ import jax.random as jrandom
 import numpy as np
 
 from jaxatari.environment import JAXAtariAction as Action
-from jaxatari.games.jax_icehockey import JaxIceHockey
+from jaxatari.games.jax_icehockey import IceHockeyConstants, JaxIceHockey
 
 UPSCALE = 4
 
@@ -48,8 +49,12 @@ def to_uint8_image(raster) -> np.ndarray:
     return img
 
 
-def snapshot(out_path: str, scale: int) -> None:
-    env = JaxIceHockey()
+def make_env(debug: bool) -> JaxIceHockey:
+    return JaxIceHockey(IceHockeyConstants(DEBUG_RENDER=debug))
+
+
+def snapshot(out_path: str, scale: int, debug: bool) -> None:
+    env = make_env(debug)
     _obs, state = env.reset(jrandom.PRNGKey(0))
     raster = env.render(state)
     img = to_uint8_image(raster)
@@ -99,10 +104,10 @@ def get_action(pygame, keys, up_key, down_key, left_key, right_key, fire_key):
     return Action.NOOP
 
 
-def play(scale: int, keyboard_enemy: bool) -> None:
+def play(scale: int, keyboard_enemy: bool, debug: bool) -> None:
     import pygame
 
-    env = JaxIceHockey()
+    env = make_env(debug)
     reset_fn = jax.jit(env.reset)
     step_fn = jax.jit(env.step)
     render_fn = jax.jit(env.render)
@@ -173,6 +178,11 @@ def main() -> None:
     parser.add_argument("--scale", type=int, default=UPSCALE, help="upscale factor")
     parser.add_argument("--cpu", action="store_true", help="force JAX onto CPU")
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="draw character position pixels and puck pickup regions",
+    )
+    parser.add_argument(
         "--keyboard-enemy",
         action="store_true",
         help="control the enemy with WASD and left shift instead of the NPC controller",
@@ -180,9 +190,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.play:
-        play(args.scale, args.keyboard_enemy)
+        play(args.scale, args.keyboard_enemy, args.debug)
     else:
-        snapshot(args.out, args.scale)
+        snapshot(args.out, args.scale, args.debug)
 
 
 if __name__ == "__main__":

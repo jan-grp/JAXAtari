@@ -150,6 +150,8 @@ def _get_default_asset_config() -> tuple:
 
 
 class IceHockeyConstants(struct.PyTreeNode):
+    DEBUG_RENDER: bool = struct.field(pytree_node=False, default=False)
+
     # Static parameters. Marked pytree_node=False so JAX keeps them as static
     # metadata instead of tracing them.
     WIDTH: int = struct.field(pytree_node=False, default=160)
@@ -244,13 +246,10 @@ class IceHockeyConstants(struct.PyTreeNode):
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
     PICKUP_BOX_H: float = struct.field(pytree_node=False, default=4.0)
     PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=14.0)
-
-    PLAYER_PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=14.0)
-
-    ENEMY_PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=26.0)
-
+    PLAYER_PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=19.0)
+    ENEMY_PICKUP_BOX_OFFSET_Y: float = struct.field(pytree_node=False, default=19.0)
     PICKUP_BOX_OFFSET_X_LEFT: float = struct.field(pytree_node=False, default=0.0)
-    PICKUP_BOX_OFFSET_X_RIGHT: float = struct.field(pytree_node=False, default=18.0)
+    PICKUP_BOX_OFFSET_X_RIGHT: float = struct.field(pytree_node=False, default=9.0)
 
     # Asset manifest lives in the constants so the modding framework can apply
     # asset_overrides before the renderer is constructed.
@@ -1454,6 +1453,25 @@ class IceHockeyRenderer(JAXGameRenderer):
         )
 
         final_asset_config = list(self.consts.ASSET_CONFIG)
+        debug_red = jnp.array([255, 0, 0, 255], dtype=jnp.uint8)
+        debug_dot = debug_red.reshape(1, 1, 4)
+        debug_box_h = int(round(self.consts.PICKUP_BOX_H)) + 1
+        debug_box_w = int(round(self.consts.PICKUP_BOX_W)) + 1
+        debug_pickup_box = jnp.zeros((debug_box_h, debug_box_w, 4), dtype=jnp.uint8)
+        debug_pickup_box = debug_pickup_box.at[0, :, :].set(debug_red)
+        debug_pickup_box = debug_pickup_box.at[-1, :, :].set(debug_red)
+        debug_pickup_box = debug_pickup_box.at[:, 0, :].set(debug_red)
+        debug_pickup_box = debug_pickup_box.at[:, -1, :].set(debug_red)
+        final_asset_config.extend(
+            [
+                {"name": "debug_position_dot", "type": "procedural", "data": debug_dot},
+                {
+                    "name": "debug_pickup_box",
+                    "type": "procedural",
+                    "data": debug_pickup_box,
+                },
+            ]
+        )
         (
             self.PALETTE,
             self.SHAPE_MASKS,
@@ -1489,6 +1507,8 @@ class IceHockeyRenderer(JAXGameRenderer):
         p_shoot_r = self.SHAPE_MASKS["player_shooting_right"]
         e_shoot_l = self.SHAPE_MASKS["enemy_shooting_left"]
         e_shoot_r = self.SHAPE_MASKS["enemy_shooting_right"]
+        debug_dot = self.SHAPE_MASKS["debug_position_dot"]
+        debug_pickup_box = self.SHAPE_MASKS["debug_pickup_box"]
         cadence = self.consts.ANIM_CADENCE
 
         def col(pos):
@@ -1496,6 +1516,31 @@ class IceHockeyRenderer(JAXGameRenderer):
 
         def row(pos):
             return jnp.round(pos[1]).astype(jnp.int32)
+
+        def draw_position_dot(r, char):
+            return self.jr.render_at_clipped(
+                r,
+                col(char.position),
+                row(char.position),
+                debug_dot,
+            )
+
+        def pickup_box_pos(char, offset_y):
+            offset_x = jnp.where(
+                char.orientation == 0,
+                self.consts.PICKUP_BOX_OFFSET_X_LEFT,
+                self.consts.PICKUP_BOX_OFFSET_X_RIGHT,
+            )
+            return char.position + jnp.array([offset_x, offset_y])
+
+        def draw_pickup_box(r, char, offset_y):
+            box_pos = pickup_box_pos(char, offset_y)
+            return self.jr.render_at_clipped(
+                r,
+                col(box_pos),
+                row(box_pos),
+                debug_pickup_box,
+            )
 
         def draw_oriented(r, char, left_mask, right_mask):
             return jax.lax.cond(
@@ -1683,6 +1728,17 @@ class IceHockeyRenderer(JAXGameRenderer):
             row(state.puck_state.position),
             puck_m,
         )
+        if self.consts.DEBUG_RENDER:
+            player_offset_y = self.consts.PLAYER_PICKUP_BOX_OFFSET_Y
+            enemy_offset_y = self.consts.ENEMY_PICKUP_BOX_OFFSET_Y
+            raster = draw_pickup_box(raster, state.player_state.goalie, player_offset_y)
+            raster = draw_pickup_box(raster, state.enemy_state.goalie, enemy_offset_y)
+            raster = draw_pickup_box(raster, state.player_state.skater, player_offset_y)
+            raster = draw_pickup_box(raster, state.enemy_state.skater, enemy_offset_y)
+            raster = draw_position_dot(raster, state.player_state.goalie)
+            raster = draw_position_dot(raster, state.enemy_state.goalie)
+            raster = draw_position_dot(raster, state.player_state.skater)
+            raster = draw_position_dot(raster, state.enemy_state.skater)
 
         dm_blue = self.SHAPE_MASKS["digits"]  # player score (blue team)
         dm_gold = self.SHAPE_MASKS["digits_gold"]  # enemy score (gold team)
