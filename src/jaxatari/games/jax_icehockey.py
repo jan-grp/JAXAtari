@@ -293,6 +293,7 @@ class PuckState:
     velocity: chex.Array  # float32 [vx, vy]
     direction: chex.Array  # shot angle slot, 0-31
     position_stick: chex.Array  # slot on the stick arc while carried, 0-31
+    pickup_blocker: chex.Array  # -1 = none, 0..3 = shooter must leave pickup box
 
 
 @struct.dataclass
@@ -431,6 +432,7 @@ class JaxIceHockey(JaxEnvironment):
                 velocity=jnp.array([0, 0], dtype=jnp.float32),
                 direction=jnp.array(0, dtype=jnp.int32),
                 position_stick=jnp.array(0, dtype=jnp.int32),
+                pickup_blocker=jnp.array(-1, dtype=jnp.int32),
             ),
             counter=jnp.array(0, dtype=jnp.int32),
             rng=key if key is not None else jrandom.PRNGKey(0),
@@ -465,7 +467,8 @@ class JaxIceHockey(JaxEnvironment):
             player_action=player_action,
             enemy_action=enemy_action,
         )
-        new_player_state, new_enemy_state = self._puck_pickup(
+
+        new_player_state, new_enemy_state, new_puck_state = self._puck_pickup(
             new_player_state, new_enemy_state, state.puck_state
         )
 
@@ -479,7 +482,7 @@ class JaxIceHockey(JaxEnvironment):
         )
 
         new_puck_state = self._puck_carry(
-            new_player_state, new_enemy_state, state.puck_state, state.counter
+            new_player_state, new_enemy_state, new_puck_state, state.counter
         )
         new_player_state, new_enemy_state, new_puck_state = self._puck_shoot(
             new_player_state, new_enemy_state, new_puck_state
@@ -1145,7 +1148,7 @@ class JaxIceHockey(JaxEnvironment):
         player_state: PlayerState,
         enemy_state: EnemyState,
         puck_state: PuckState,
-    ) -> tuple[PlayerState, EnemyState]:
+    ) -> tuple[PlayerState, EnemyState, PuckState]:
 
         c = self.consts
         puck_pos = puck_state.position
@@ -1188,11 +1191,22 @@ class JaxIceHockey(JaxEnvironment):
         )
         holds = jnp.array([char.has_puck for char in chars])
 
-        grab = is_active & in_box
+        char_indices = jnp.arange(4, dtype=jnp.int32)
+        blocker_mask = char_indices == puck_state.pickup_blocker
+        blocker_active = puck_state.pickup_blocker >= 0
+        blocker_still_in_box = blocker_active & jnp.any(blocker_mask & in_box)
+        blocked = blocker_still_in_box & blocker_mask
+
+        grab = is_active & in_box & ~blocked
         challenger = grab & ~holds
         score = challenger.astype(jnp.int32) * 2 + holds.astype(jnp.int32)
         winner = jnp.argmax(score)
         new_has_puck = (jnp.arange(4) == winner) & (jnp.max(score) > 0)
+        new_pickup_blocker = jnp.where(
+            blocker_still_in_box & ~jnp.any(new_has_puck),
+            puck_state.pickup_blocker,
+            jnp.array(-1, dtype=jnp.int32),
+        )
 
         new_player_state = player_state.replace(
             skater=player_state.skater.replace(has_puck=new_has_puck[0]),
@@ -1202,7 +1216,11 @@ class JaxIceHockey(JaxEnvironment):
             skater=enemy_state.skater.replace(has_puck=new_has_puck[2]),
             goalie=enemy_state.goalie.replace(has_puck=new_has_puck[3]),
         )
-        return new_player_state, new_enemy_state
+        return (
+            new_player_state,
+            new_enemy_state,
+            puck_state.replace(pickup_blocker=new_pickup_blocker),
+        )
 
     def _puck_carry(
         self,
@@ -1273,6 +1291,25 @@ class JaxIceHockey(JaxEnvironment):
             ),
         )
         new_velocity = jnp.where(should_shoot, shot_vel, puck_state.velocity)
+        new_position = jnp.where(
+            should_shoot, puck_state.position + shot_vel, puck_state.position
+        )
+        shooter_index = jnp.where(
+            sk_shoots,
+            jnp.array(0, dtype=jnp.int32),
+            jnp.where(
+                go_shoots,
+                jnp.array(1, dtype=jnp.int32),
+                jnp.where(
+                    e_sk_shoots,
+                    jnp.array(2, dtype=jnp.int32),
+                    jnp.array(3, dtype=jnp.int32),
+                ),
+            ),
+        )
+        new_pickup_blocker = jnp.where(
+            should_shoot, shooter_index, puck_state.pickup_blocker
+        )
         new_player_state = player_state.replace(
             skater=p_sk.replace(has_puck=p_sk.has_puck & ~sk_shoots),
             goalie=p_go.replace(has_puck=p_go.has_puck & ~go_shoots),
@@ -1284,7 +1321,11 @@ class JaxIceHockey(JaxEnvironment):
         return (
             new_player_state,
             new_enemy_state,
-            puck_state.replace(velocity=new_velocity),
+            puck_state.replace(
+                position=new_position,
+                velocity=new_velocity,
+                pickup_blocker=new_pickup_blocker,
+            ),
         )
 
     def _characters_step(
