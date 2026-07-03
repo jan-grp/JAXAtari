@@ -1,6 +1,7 @@
 import os
 from functools import partial
 from typing import Tuple, Optional, Union
+from jax import lax
 import jax.random as jrandom
 import jax
 import jax.numpy as jnp
@@ -166,8 +167,8 @@ class IceHockeyConstants(struct.PyTreeNode):
     # Goals. Player defends the top, enemy the bottom.
     GOAL_X0: int = struct.field(pytree_node=False, default=64)
     GOAL_X1: int = struct.field(pytree_node=False, default=96)
-    ENEMY_GOAL_Y: int = struct.field(pytree_node=False, default=186)
-    PLAYER_GOAL_Y: int = struct.field(pytree_node=False, default=42)
+    ENEMY_GOAL_Y: int = struct.field(pytree_node=False, default=186) # Bottom goal line
+    PLAYER_GOAL_Y: int = struct.field(pytree_node=False, default=42) # top goal line
     GOAL_HEIGHT: int = struct.field(pytree_node=False, default=4)
 
     # Sprite sizes, used for observation bounding boxes
@@ -175,6 +176,10 @@ class IceHockeyConstants(struct.PyTreeNode):
     PLAYER_H: int = struct.field(pytree_node=False, default=26)
     PUCK_W: int = struct.field(pytree_node=False, default=2)
     PUCK_H: int = struct.field(pytree_node=False, default=2)
+
+    # Character center
+    CHARACTER_CENTER_DX: int = struct.field(pytree_node=False, default=13)
+    CHARACTER_CENTER_DY: int = struct.field(pytree_node=False, default=13)
 
     PLAYER_SPEED: float = struct.field(pytree_node=False, default=1.5)
 
@@ -675,41 +680,85 @@ class JaxIceHockey(JaxEnvironment):
             goalie=self._decrement_tackle(new_enemy_goalie),
         )
         return new_player_state, new_enemy_state
-
-    def _resolve_active_character(
+    
+    def _resolve_active_characters(
         self,
-        char1: CharacterState,
-        char2: CharacterState,
+        player_state: PlayerState,
+        enemy_state: EnemyState,
         puck_position: chex.Array,
-        current_active: chex.Array,
-    ) -> chex.Array:
-        """Resolve which of two characters is closest to the puck.
+    ) -> Tuple[chex.Array, chex.Array]:
+        c = self.consts
 
-        Control in Ice Hockey goes to whichever of a team's two skaters is closest to
-        the puck, so ``_player_step`` and ``_enemy_step`` both call this on their own
-        pair.
-
-        Args:
-            char1: First character (corresponds to index 0).
-            char2: Second character (corresponds to index 1).
-            puck_position: ``(x, y)`` position of the puck.
-            current_active: Index (0 or 1) returned on an exact distance tie, which
-                avoids the result flickering between equidistant characters.
-
-        Returns:
-            An ``int32`` scalar: 0 if ``char1`` is closer, 1 if ``char2`` is.
-        """
-        # Squared distance from each character to the puck; sqrt is unnecessary for ordering.
-        dist1_sq = jnp.sum((char1.position - puck_position) ** 2)
-        dist2_sq = jnp.sum((char2.position - puck_position) ** 2)
-
-        # Closest character wins; on an exact tie keep whoever is currently active.
-        closest = jnp.where(
-            dist1_sq < dist2_sq,
-            0,
-            jnp.where(dist2_sq < dist1_sq, 1, current_active),
+        center_offset = jnp.array(
+            [c.CHARACTER_CENTER_DX, c.CHARACTER_CENTER_DY],
+            dtype=puck_position.dtype,
         )
-        return closest.astype(jnp.int32)
+
+        def closest_character(char_a, char_b) -> chex.Array:
+            # index 0 = skater, index 1 = goalie
+            centers = jnp.stack(
+                [char_a.position, char_b.position],
+                axis=0,
+            ) + center_offset
+            dist_sq = jnp.sum((centers - puck_position) ** 2, axis=-1)
+            return jnp.argmin(dist_sq).astype(jnp.int32)
+
+        puck_in_player_goal_zone = (
+            puck_position[1] <= c.PLAYER_GOAL_Y + c.ATTACKING_ZONE_OFFSET_Y + c.PLAYER_H - 2
+        )
+        puck_in_enemy_goal_zone = (
+            puck_position[1] >= c.ENEMY_GOAL_Y - c.ATTACKING_ZONE_OFFSET_Y + 2
+        )
+
+        def resolve_team_active(
+            skater: CharacterState,
+            goalie: CharacterState,
+            fallback_active,
+        ) -> chex.Array:
+            skater_active = skater.has_puck | goalie.is_tackled
+            goalie_active = goalie.has_puck | skater.is_tackled
+            rule_applies = skater_active | goalie_active
+            rule_active = jnp.where(skater_active, jnp.int32(0), jnp.int32(1))
+            return jax.lax.cond(
+                rule_applies,
+                lambda _: rule_active,
+                lambda _: fallback_active(),
+                operand=None,
+            )
+
+        def player_fallback_active() -> chex.Array:
+            return jax.lax.cond(
+                puck_in_player_goal_zone,
+                lambda _: jnp.int32(1),  # player goalie
+                lambda _: jax.lax.cond(
+                    puck_in_enemy_goal_zone,
+                    lambda __: jnp.int32(0),  # player skater
+                    lambda __: closest_character(player_state.skater, player_state.goalie),
+                    operand=None,
+                ),
+                operand=None,
+            )
+
+        def enemy_fallback_active() -> chex.Array:
+            return jax.lax.cond(
+                puck_in_player_goal_zone,
+                lambda _: jnp.int32(0),  # enemy skater
+                lambda _: jax.lax.cond(
+                    puck_in_enemy_goal_zone,
+                    lambda __: jnp.int32(1),  # enemy goalie
+                    lambda __: closest_character(enemy_state.skater, enemy_state.goalie),
+                    operand=None,
+                ),
+                operand=None,
+            )
+
+        active_player = resolve_team_active(
+            player_state.skater, player_state.goalie, player_fallback_active
+        )
+        active_enemy = resolve_team_active(
+            enemy_state.skater, enemy_state.goalie, enemy_fallback_active
+        )
+        return active_player, active_enemy
 
     def _apply_action(
         self,
@@ -1291,24 +1340,13 @@ class JaxIceHockey(JaxEnvironment):
         )
 
         # 1) Active-skater resolution (per team, against the shared puck).
-        player_active = self._resolve_active_character(
-            player_state.skater,
-            player_state.goalie,
-            puck_position,
-            player_state.active_character,
-        )
-        enemy_active = self._resolve_active_character(
-            enemy_state.skater,
-            enemy_state.goalie,
-            puck_position,
-            enemy_state.active_character,
-        )
+        active_player, active_enemy = self._resolve_active_characters(player_state, enemy_state, puck_position)
 
         # 2) Phase 1 — intended input movement, uniform over each team's two skaters.
         p1, p2 = self._apply_team_inputs(
             player_state.skater,
             player_state.goalie,
-            player_active,
+            active_player,
             player_action,
             bounds_player_skater,
             bounds_player_goalie,
@@ -1317,7 +1355,7 @@ class JaxIceHockey(JaxEnvironment):
         e1, e2 = self._apply_team_inputs(
             enemy_state.skater,
             enemy_state.goalie,
-            enemy_active,
+            active_enemy,
             enemy_action,
             bounds_enemy_skater,
             bounds_enemy_goalie,
@@ -1330,8 +1368,8 @@ class JaxIceHockey(JaxEnvironment):
             p2,
             e1,
             e2,
-            player_active,
-            enemy_active,
+            active_player,
+            active_enemy,
             min_separation,
             min_vertical_distance,
             bounds_player_skater,
@@ -1343,12 +1381,12 @@ class JaxIceHockey(JaxEnvironment):
         new_player_state = player_state.replace(
             skater=p1,
             goalie=p2,
-            active_character=player_active,
+            active_character=active_player,
         )
         new_enemy_state = enemy_state.replace(
             skater=e1,
             goalie=e2,
-            active_character=enemy_active,
+            active_character=active_enemy,
         )
         return new_player_state, new_enemy_state
 
@@ -1757,4 +1795,17 @@ class IceHockeyRenderer(JAXGameRenderer):
         raster = draw_score(raster, state.game_state.player_score, 43, 33, dm_blue)
         raster = draw_score(raster, state.game_state.enemy_score, 113, 103, dm_gold)
 
-        return self.jr.render_from_palette(raster, self.PALETTE)
+        frame = self.jr.render_from_palette(raster, self.PALETTE)
+
+        if self.consts.DEBUG_RENDER:
+            c = self.consts
+            blue = jnp.array([0, 0, 255], dtype=frame.dtype)
+            x0 = c.RINK_LEFT
+            x1 = min(c.RINK_RIGHT + 1, c.WIDTH)
+            player_attack_line_y = c.PLAYER_GOAL_Y + c.ATTACKING_ZONE_OFFSET_Y
+            enemy_attack_line_y = c.ENEMY_GOAL_Y - c.ATTACKING_ZONE_OFFSET_Y
+
+            frame = frame.at[player_attack_line_y, x0:x1, :].set(blue)
+            frame = frame.at[enemy_attack_line_y, x0:x1, :].set(blue)
+
+        return frame
