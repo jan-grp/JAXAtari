@@ -218,8 +218,12 @@ class IceHockeyConstants(struct.PyTreeNode):
     TACKLE_FRAMES_MIN: int = struct.field(pytree_node=False, default=60)
     TACKLE_FRAMES_MAX: int = struct.field(pytree_node=False, default=120)
 
+    # 3 min * 60 s * 60 fps = 10800 frames, in frames of active play
     TIME_LIMIT: int = struct.field(pytree_node=False, default=10800)
-    FACE_OFF_FRAMES: int = struct.field(pytree_node=False, default=40)
+    # freeze duration of the face-off countdown (after reset and after goals)
+    FACE_OFF_FRAMES: int = struct.field(pytree_node=False, default=63)
+    # freeze after a goal before everyone snaps back to the face-off spots
+    GOAL_PAUSE_FRAMES: int = struct.field(pytree_node=False, default=64)
 
     # Face-off layout. [x, y] = [col, row].
     FACEOFF_X: float = struct.field(pytree_node=False, default=79.0)
@@ -399,9 +403,8 @@ class JaxIceHockey(JaxEnvironment):
     def image_space(self) -> spaces.Box:
         return spaces.Box(low=0, high=255, shape=(210, 160, 3), dtype=jnp.uint8)
 
-    @partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey = None) -> Tuple:
-        # Face-off: puck at centre, characters on start positions
+    def _faceoff_positions(self) -> Tuple[PlayerState, EnemyState, PuckState]:
+        """Fresh character/puck states on the face-off spots (reset + after goals)."""
         c = self.consts
 
         def char(x, y, orientation):
@@ -415,25 +418,35 @@ class JaxIceHockey(JaxEnvironment):
                 tackle_timer=jnp.array(0, dtype=jnp.int32),
             )
 
+        player_state = PlayerState(
+            skater=char(c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1),
+            goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y, orientation=0),
+            active_character=jnp.array(0, dtype=jnp.int32),
+        )
+        enemy_state = EnemyState(
+            skater=char(c.ENEMY_SKATER_X, c.ENEMY_SKATER_Y, orientation=0),
+            goalie=char(c.ENEMY_GOALIE_X, c.ENEMY_GOALIE_Y, orientation=0),
+            active_character=jnp.array(0, dtype=jnp.int32),
+        )
+        puck_state = PuckState(
+            position=jnp.array([c.FACEOFF_X, c.FACEOFF_Y], dtype=jnp.float32),
+            velocity=jnp.array([0, 0], dtype=jnp.float32),
+            direction=jnp.array(0, dtype=jnp.int32),
+            position_stick=jnp.array(0, dtype=jnp.int32),
+            pickup_blocker=jnp.array(-1, dtype=jnp.int32),
+        )
+        return player_state, enemy_state, puck_state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, key: chex.PRNGKey = None) -> Tuple:
+        # Face-off: puck at centre, characters on start positions
+        c = self.consts
+        player_state, enemy_state, puck_state = self._faceoff_positions()
+
         state = IceHockeyState(
-            player_state=PlayerState(
-                skater=char(c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1),
-                goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y, orientation=0),
-                active_character=jnp.array(0, dtype=jnp.int32),
-            ),
-            enemy_state=EnemyState(
-                skater=char(c.ENEMY_SKATER_X, c.ENEMY_SKATER_Y, orientation=0),
-                goalie=char(c.ENEMY_GOALIE_X, c.ENEMY_GOALIE_Y, orientation=0),
-                active_character=jnp.array(0, dtype=jnp.int32),
-            ),
-            puck_state=PuckState(
-                position=jnp.array([c.FACEOFF_X, c.FACEOFF_Y], dtype=jnp.float32),
-                # just a const to test it remove when finished
-                velocity=jnp.array([0, 0], dtype=jnp.float32),
-                direction=jnp.array(0, dtype=jnp.int32),
-                position_stick=jnp.array(0, dtype=jnp.int32),
-                pickup_blocker=jnp.array(-1, dtype=jnp.int32),
-            ),
+            player_state=player_state,
+            enemy_state=enemy_state,
+            puck_state=puck_state,
             counter=jnp.array(0, dtype=jnp.int32),
             rng=key if key is not None else jrandom.PRNGKey(0),
             game_state=GameState(
@@ -441,9 +454,7 @@ class JaxIceHockey(JaxEnvironment):
                 player_score=jnp.array(0, dtype=jnp.int32),
                 enemy_score=jnp.array(0, dtype=jnp.int32),
                 remaining_time=jnp.array(c.TIME_LIMIT, dtype=jnp.int32),
-                is_faceoff=jnp.array(
-                    False
-                ),  # False, until face off is properly implemented
+                is_faceoff=jnp.array(True),
                 goal_scored=jnp.array(False),
                 is_finished=jnp.array(False),
             ),
@@ -459,33 +470,100 @@ class JaxIceHockey(JaxEnvironment):
             enemy_action = self._enemy_policy(state)
 
         previous_state = state
+        c = self.consts
+        gs = state.game_state
 
-        new_player_state, new_enemy_state = self._characters_step(
-            state.player_state,
-            state.enemy_state,
-            state.puck_state.position,
-            player_action=player_action,
-            enemy_action=enemy_action,
-        )
+        # no movement and no clock during goal pause, face-off and after game end
+        frozen = gs.is_finished | gs.goal_scored | gs.is_faceoff
 
-        new_player_state, new_enemy_state, new_puck_state = self._puck_pickup(
-            new_player_state, new_enemy_state, state.puck_state
-        )
-
-        # Tackle: the player's active skater can body-check an enemy with FIRE.
         rng, tackle_key = jrandom.split(state.rng)
-        new_player_state, new_enemy_state = self._tackle_step(
-            new_player_state,
-            new_enemy_state,
-            action,
-            tackle_key,
+
+        def play_step(_):
+            new_player_state, new_enemy_state = self._characters_step(
+                state.player_state,
+                state.enemy_state,
+                state.puck_state.position,
+                player_action=player_action,
+                enemy_action=enemy_action,
+            )
+
+            new_player_state, new_enemy_state, new_puck_state = self._puck_pickup(
+                new_player_state, new_enemy_state, state.puck_state
+            )
+
+            # Tackle: the player's active skater can body-check an enemy with FIRE.
+            new_player_state, new_enemy_state = self._tackle_step(
+                new_player_state,
+                new_enemy_state,
+                player_action,
+                tackle_key,
+            )
+
+            new_puck_state = self._puck_carry(
+                new_player_state, new_enemy_state, new_puck_state, state.counter
+            )
+            new_player_state, new_enemy_state, new_puck_state = self._puck_shoot(
+                new_player_state, new_enemy_state, new_puck_state
+            )
+            return new_player_state, new_enemy_state, new_puck_state
+
+        def hold_step(_):
+            return state.player_state, state.enemy_state, state.puck_state
+
+        new_player_state, new_enemy_state, new_puck_state = jax.lax.cond(
+            frozen, hold_step, play_step, None
         )
 
-        new_puck_state = self._puck_carry(
-            new_player_state, new_enemy_state, new_puck_state, state.counter
+        # Goal: a free (not carried) puck touching a goal line inside the mouth.
+        puck_pos = new_puck_state.position
+        carried = (
+            new_player_state.skater.has_puck
+            | new_player_state.goalie.has_puck
+            | new_enemy_state.skater.has_puck
+            | new_enemy_state.goalie.has_puck
         )
-        new_player_state, new_enemy_state, new_puck_state = self._puck_shoot(
-            new_player_state, new_enemy_state, new_puck_state
+        in_mouth = (puck_pos[0] >= c.GOAL_X0) & (puck_pos[0] <= c.GOAL_X1)
+        player_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] >= c.ENEMY_GOAL_Y)
+        enemy_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] <= c.PLAYER_GOAL_Y)
+        goal = player_scored | enemy_scored
+
+        # Clock only runs during play; a goal rounds it up to the next full
+        # second so the tick restarts fresh after the face-off (like the ROM).
+        rt = gs.remaining_time
+        rt = jnp.where(goal, ((rt + 59) // 60) * 60, rt)
+        clock_runs = ~frozen & ~goal
+        rt = jnp.where(clock_runs, jnp.maximum(rt - 1, 0), rt)
+        time_up = clock_runs & (rt == 0)
+
+        # pause phases: goal pause -> face-off countdown -> play
+        pc = jnp.where(frozen, jnp.maximum(gs.pause_counter - 1, 0), gs.pause_counter)
+        goal_phase_over = gs.goal_scored & (pc == 0)
+        faceoff_over = gs.is_faceoff & (pc == 0)
+
+        new_goal_scored = (gs.goal_scored & ~goal_phase_over) | goal
+        new_is_faceoff = (gs.is_faceoff & ~faceoff_over) | goal_phase_over
+        pc = jnp.where(
+            goal,
+            jnp.int32(c.GOAL_PAUSE_FRAMES),
+            jnp.where(goal_phase_over, jnp.int32(c.FACE_OFF_FRAMES), pc),
+        )
+
+        # after the goal pause everyone snaps back to the face-off spots
+        fo_player, fo_enemy, fo_puck = self._faceoff_positions()
+        new_player_state, new_enemy_state, new_puck_state = jax.lax.cond(
+            goal_phase_over,
+            lambda: (fo_player, fo_enemy, fo_puck),
+            lambda: (new_player_state, new_enemy_state, new_puck_state),
+        )
+
+        new_game_state = gs.replace(
+            pause_counter=pc,
+            player_score=gs.player_score + player_scored.astype(jnp.int32),
+            enemy_score=gs.enemy_score + enemy_scored.astype(jnp.int32),
+            remaining_time=rt,
+            is_faceoff=new_is_faceoff,
+            goal_scored=new_goal_scored,
+            is_finished=gs.is_finished | time_up,
         )
 
         state = state.replace(
@@ -493,6 +571,7 @@ class JaxIceHockey(JaxEnvironment):
             enemy_state=new_enemy_state,
             puck_state=new_puck_state,
             counter=state.counter + 1,
+            game_state=new_game_state,
             rng=rng,
         )
 
@@ -1541,6 +1620,11 @@ class IceHockeyRenderer(JAXGameRenderer):
         debug_pickup_box = debug_pickup_box.at[-1, :, :].set(debug_red)
         debug_pickup_box = debug_pickup_box.at[:, 0, :].set(debug_red)
         debug_pickup_box = debug_pickup_box.at[:, -1, :].set(debug_red)
+        # colon for the clock, two dots in the blue scoreboard colour
+        clock_blue = jnp.array([84, 92, 214, 255], dtype=jnp.uint8)
+        clock_colon = jnp.zeros((7, 2, 4), dtype=jnp.uint8)
+        clock_colon = clock_colon.at[1, :, :].set(clock_blue)
+        clock_colon = clock_colon.at[5, :, :].set(clock_blue)
         final_asset_config.extend(
             [
                 {"name": "debug_position_dot", "type": "procedural", "data": debug_dot},
@@ -1549,6 +1633,7 @@ class IceHockeyRenderer(JAXGameRenderer):
                     "type": "procedural",
                     "data": debug_pickup_box,
                 },
+                {"name": "clock_colon", "type": "procedural", "data": clock_colon},
             ]
         )
         (
@@ -1829,12 +1914,29 @@ class IceHockeyRenderer(JAXGameRenderer):
             count = jax.lax.select(is_single, jnp.int32(1), jnp.int32(2))
             x = jax.lax.select(is_single, jnp.int32(x_single), jnp.int32(x_double))
             return self.jr.render_label_selective(
-                r, x, 3, digits, dm, start, count, spacing=7, max_digits_to_render=2
+                r, x, 14, digits, dm, start, count, spacing=7, max_digits_to_render=2
             )
 
         # Blue (player) score on the left, gold (enemy) on the right, as in the ROM.
         raster = draw_score(raster, state.game_state.player_score, 43, 33, dm_blue)
         raster = draw_score(raster, state.game_state.enemy_score, 113, 103, dm_gold)
+
+        # Clock "M:SS" at the top. remaining_time is in frames; round up so
+        # 3:00 stays visible until the first tick.
+        clock_secs = (state.game_state.remaining_time + 59) // 60
+        clock_min = clock_secs // 60
+        clock_sec = clock_secs % 60
+        min_digits = self.jr.int_to_digits(clock_min, max_digits=2)
+        sec_digits = self.jr.int_to_digits(clock_sec, max_digits=2)
+        raster = self.jr.render_label_selective(
+            raster, 65, 5, min_digits, dm_blue, 1, 1, spacing=8, max_digits_to_render=2
+        )
+        raster = self.jr.render_at_clipped(
+            raster, 75, 5, self.SHAPE_MASKS["clock_colon"]
+        )
+        raster = self.jr.render_label_selective(
+            raster, 81, 5, sec_digits, dm_blue, 0, 2, spacing=8, max_digits_to_render=2
+        )
 
         frame = self.jr.render_from_palette(raster, self.PALETTE)
 
