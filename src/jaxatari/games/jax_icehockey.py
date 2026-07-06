@@ -470,7 +470,6 @@ class JaxIceHockey(JaxEnvironment):
             enemy_action = self._enemy_policy(state)
 
         previous_state = state
-        c = self.consts
         gs = state.game_state
 
         # no movement and no clock during goal pause, face-off and after game end
@@ -514,56 +513,17 @@ class JaxIceHockey(JaxEnvironment):
             frozen, hold_step, play_step, None
         )
 
-        # Goal: a free (not carried) puck touching a goal line inside the mouth.
-        puck_pos = new_puck_state.position
-        carried = (
-            new_player_state.skater.has_puck
-            | new_player_state.goalie.has_puck
-            | new_enemy_state.skater.has_puck
-            | new_enemy_state.goalie.has_puck
-        )
-        in_mouth = (puck_pos[0] >= c.GOAL_X0) & (puck_pos[0] <= c.GOAL_X1)
-        player_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] >= c.ENEMY_GOAL_Y)
-        enemy_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] <= c.PLAYER_GOAL_Y)
-        goal = player_scored | enemy_scored
-
-        # Clock only runs during play; a goal rounds it up to the next full
-        # second so the tick restarts fresh after the face-off (like the ROM).
-        rt = gs.remaining_time
-        rt = jnp.where(goal, ((rt + 59) // 60) * 60, rt)
-        clock_runs = ~frozen & ~goal
-        rt = jnp.where(clock_runs, jnp.maximum(rt - 1, 0), rt)
-        time_up = clock_runs & (rt == 0)
-
-        # pause phases: goal pause -> face-off countdown -> play
-        pc = jnp.where(frozen, jnp.maximum(gs.pause_counter - 1, 0), gs.pause_counter)
-        goal_phase_over = gs.goal_scored & (pc == 0)
-        faceoff_over = gs.is_faceoff & (pc == 0)
-
-        new_goal_scored = (gs.goal_scored & ~goal_phase_over) | goal
-        new_is_faceoff = (gs.is_faceoff & ~faceoff_over) | goal_phase_over
-        pc = jnp.where(
-            goal,
-            jnp.int32(c.GOAL_PAUSE_FRAMES),
-            jnp.where(goal_phase_over, jnp.int32(c.FACE_OFF_FRAMES), pc),
-        )
-
-        # after the goal pause everyone snaps back to the face-off spots
-        fo_player, fo_enemy, fo_puck = self._faceoff_positions()
-        new_player_state, new_enemy_state, new_puck_state = jax.lax.cond(
-            goal_phase_over,
-            lambda: (fo_player, fo_enemy, fo_puck),
-            lambda: (new_player_state, new_enemy_state, new_puck_state),
-        )
-
-        new_game_state = gs.replace(
-            pause_counter=pc,
-            player_score=gs.player_score + player_scored.astype(jnp.int32),
-            enemy_score=gs.enemy_score + enemy_scored.astype(jnp.int32),
-            remaining_time=rt,
-            is_faceoff=new_is_faceoff,
-            goal_scored=new_goal_scored,
-            is_finished=gs.is_finished | time_up,
+        (
+            new_player_state,
+            new_enemy_state,
+            new_puck_state,
+            new_game_state,
+        ) = self._goal_and_reset_step(
+            gs,
+            new_player_state,
+            new_enemy_state,
+            new_puck_state,
+            frozen,
         )
 
         state = state.replace(
@@ -583,6 +543,86 @@ class JaxIceHockey(JaxEnvironment):
 
     def _enemy_policy(self, state: IceHockeyState) -> chex.Array:
         return jnp.array(Action.NOOP, dtype=jnp.int32)
+
+    def _goal_and_reset_step(
+        self,
+        game_state: GameState,
+        player_state: PlayerState,
+        enemy_state: EnemyState,
+        puck_state: PuckState,
+        frozen: chex.Array,
+    ) -> Tuple[PlayerState, EnemyState, PuckState, GameState]:
+        """Detect goals, advance pause phases, and reset to face-off positions."""
+        c = self.consts
+
+        # Goal: a free (not carried) puck touching a goal line inside the mouth.
+        puck_pos = puck_state.position
+        carried = (
+            player_state.skater.has_puck
+            | player_state.goalie.has_puck
+            | enemy_state.skater.has_puck
+            | enemy_state.goalie.has_puck
+        )
+        in_mouth = (puck_pos[0] >= c.GOAL_X0) & (puck_pos[0] <= c.GOAL_X1)
+        player_scored = (
+            ~frozen & ~carried & in_mouth & (puck_pos[1] >= c.ENEMY_GOAL_Y)
+        )
+        enemy_scored = (
+            ~frozen & ~carried & in_mouth & (puck_pos[1] <= c.PLAYER_GOAL_Y)
+        )
+        goal = player_scored | enemy_scored
+
+        # Clock only runs during play; a goal rounds it up to the next full
+        # second so the tick restarts fresh after the face-off (like the ROM).
+        remaining_time = game_state.remaining_time
+        remaining_time = jnp.where(
+            goal, ((remaining_time + 59) // 60) * 60, remaining_time
+        )
+        clock_runs = ~frozen & ~goal
+        remaining_time = jnp.where(
+            clock_runs, jnp.maximum(remaining_time - 1, 0), remaining_time
+        )
+        time_up = clock_runs & (remaining_time == 0)
+
+        # Pause phases: goal pause -> face-off countdown -> play.
+        pause_counter = jnp.where(
+            frozen,
+            jnp.maximum(game_state.pause_counter - 1, 0),
+            game_state.pause_counter,
+        )
+        goal_phase_over = game_state.goal_scored & (pause_counter == 0)
+        faceoff_over = game_state.is_faceoff & (pause_counter == 0)
+
+        new_goal_scored = (game_state.goal_scored & ~goal_phase_over) | goal
+        new_is_faceoff = (game_state.is_faceoff & ~faceoff_over) | goal_phase_over
+        pause_counter = jnp.where(
+            goal,
+            jnp.int32(c.GOAL_PAUSE_FRAMES),
+            jnp.where(
+                goal_phase_over,
+                jnp.int32(c.FACE_OFF_FRAMES),
+                pause_counter,
+            ),
+        )
+
+        # After the goal pause everyone snaps back to the face-off spots.
+        fo_player, fo_enemy, fo_puck = self._faceoff_positions()
+        player_state, enemy_state, puck_state = jax.lax.cond(
+            goal_phase_over,
+            lambda: (fo_player, fo_enemy, fo_puck),
+            lambda: (player_state, enemy_state, puck_state),
+        )
+
+        game_state = game_state.replace(
+            pause_counter=pause_counter,
+            player_score=game_state.player_score + player_scored.astype(jnp.int32),
+            enemy_score=game_state.enemy_score + enemy_scored.astype(jnp.int32),
+            remaining_time=remaining_time,
+            is_faceoff=new_is_faceoff,
+            goal_scored=new_goal_scored,
+            is_finished=game_state.is_finished | time_up,
+        )
+        return player_state, enemy_state, puck_state, game_state
 
     def _decrement_tackle(self, char: CharacterState) -> CharacterState:
         """Tick a character's tackle timer down one frame; clear is_tackled at 0."""
