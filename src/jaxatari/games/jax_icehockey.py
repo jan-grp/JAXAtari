@@ -167,8 +167,8 @@ class IceHockeyConstants(struct.PyTreeNode):
     # Goals. Player defends the top, enemy the bottom.
     GOAL_X0: int = struct.field(pytree_node=False, default=64)
     GOAL_X1: int = struct.field(pytree_node=False, default=96)
-    ENEMY_GOAL_Y: int = struct.field(pytree_node=False, default=186) # Bottom goal line
-    PLAYER_GOAL_Y: int = struct.field(pytree_node=False, default=42) # top goal line
+    ENEMY_GOAL_Y: int = struct.field(pytree_node=False, default=186)  # Bottom goal line
+    PLAYER_GOAL_Y: int = struct.field(pytree_node=False, default=42)  # top goal line
     GOAL_HEIGHT: int = struct.field(pytree_node=False, default=4)
 
     # Sprite sizes, used for observation bounding boxes
@@ -202,6 +202,8 @@ class IceHockeyConstants(struct.PyTreeNode):
     # Phase-2 collision tunables for _characters_step
     MIN_SEPARATION: float = struct.field(pytree_node=False, default=8.0)
     MIN_VERTICAL_DISTANCE: float = struct.field(pytree_node=False, default=40.0)
+
+    STICK_VISIBLE_CADENCE: int = struct.field(pytree_node=False, default=4)
 
     # Tackle (body-check): the active skater can knock an opponent down by pushing
     # toward them while swinging. A successful hit freezes the victim for a random
@@ -242,8 +244,8 @@ class IceHockeyConstants(struct.PyTreeNode):
     STICK_CADENCE: int = struct.field(pytree_node=False, default=1)  # Frames pro Slot
     # Stock-Endpunkte relativ zum Box-MITTELPUNKT, autoriert für Blick nach rechts.
     # # Slot 0 = an den Händen (Basis), Slot 31 = Schlägerspitze.
-    STICK_MIN_DX: float = struct.field(pytree_node=False, default=10.0)  # Slot 0
-    STICK_MAX_DX: float = struct.field(pytree_node=False, default=15.0)  # Slot 31
+    STICK_MIN_DX: float = struct.field(pytree_node=False, default=5.0)  # Slot 0
+    STICK_MAX_DX: float = struct.field(pytree_node=False, default=12.0)  # Slot 31
     # feste Höhe — bewegt sich NICHT mit.
     STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
@@ -298,6 +300,8 @@ class PuckState:
     direction: chex.Array  # shot angle slot, 0-31
     position_stick: chex.Array  # slot on the stick arc while carried, 0-31
     pickup_blocker: chex.Array  # -1 = none, 0..3 = shooter must leave pickup box
+    carry_timer: chex.Array
+    holder: chex.Array
 
 
 @struct.dataclass
@@ -434,6 +438,8 @@ class JaxIceHockey(JaxEnvironment):
             direction=jnp.array(0, dtype=jnp.int32),
             position_stick=jnp.array(0, dtype=jnp.int32),
             pickup_blocker=jnp.array(-1, dtype=jnp.int32),
+            carry_timer=jnp.array(0, dtype=jnp.int32),
+            holder=jnp.array(-1, dtype=jnp.int32),
         )
         return player_state, enemy_state, puck_state
 
@@ -564,12 +570,8 @@ class JaxIceHockey(JaxEnvironment):
             | enemy_state.goalie.has_puck
         )
         in_mouth = (puck_pos[0] >= c.GOAL_X0) & (puck_pos[0] <= c.GOAL_X1)
-        player_scored = (
-            ~frozen & ~carried & in_mouth & (puck_pos[1] >= c.ENEMY_GOAL_Y)
-        )
-        enemy_scored = (
-            ~frozen & ~carried & in_mouth & (puck_pos[1] <= c.PLAYER_GOAL_Y)
-        )
+        player_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] >= c.ENEMY_GOAL_Y)
+        enemy_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] <= c.PLAYER_GOAL_Y)
         goal = player_scored | enemy_scored
 
         # Clock only runs during play; a goal rounds it up to the next full
@@ -802,7 +804,7 @@ class JaxIceHockey(JaxEnvironment):
             goalie=self._decrement_tackle(new_enemy_goalie),
         )
         return new_player_state, new_enemy_state
-    
+
     def _resolve_active_characters(
         self,
         player_state: PlayerState,
@@ -818,15 +820,19 @@ class JaxIceHockey(JaxEnvironment):
 
         def closest_character(char_a, char_b) -> chex.Array:
             # index 0 = skater, index 1 = goalie
-            centers = jnp.stack(
-                [char_a.position, char_b.position],
-                axis=0,
-            ) + center_offset
+            centers = (
+                jnp.stack(
+                    [char_a.position, char_b.position],
+                    axis=0,
+                )
+                + center_offset
+            )
             dist_sq = jnp.sum((centers - puck_position) ** 2, axis=-1)
             return jnp.argmin(dist_sq).astype(jnp.int32)
 
         puck_in_player_goal_zone = (
-            puck_position[1] <= c.PLAYER_GOAL_Y + c.ATTACKING_ZONE_OFFSET_Y + c.PLAYER_H - 2
+            puck_position[1]
+            <= c.PLAYER_GOAL_Y + c.ATTACKING_ZONE_OFFSET_Y + c.PLAYER_H - 2
         )
         puck_in_enemy_goal_zone = (
             puck_position[1] >= c.ENEMY_GOAL_Y - c.ATTACKING_ZONE_OFFSET_Y + 2
@@ -855,7 +861,9 @@ class JaxIceHockey(JaxEnvironment):
                 lambda _: jax.lax.cond(
                     puck_in_enemy_goal_zone,
                     lambda __: jnp.int32(0),  # player skater
-                    lambda __: closest_character(player_state.skater, player_state.goalie),
+                    lambda __: closest_character(
+                        player_state.skater, player_state.goalie
+                    ),
                     operand=None,
                 ),
                 operand=None,
@@ -868,7 +876,9 @@ class JaxIceHockey(JaxEnvironment):
                 lambda _: jax.lax.cond(
                     puck_in_enemy_goal_zone,
                     lambda __: jnp.int32(1),  # enemy goalie
-                    lambda __: closest_character(enemy_state.skater, enemy_state.goalie),
+                    lambda __: closest_character(
+                        enemy_state.skater, enemy_state.goalie
+                    ),
                     operand=None,
                 ),
                 operand=None,
@@ -1224,27 +1234,37 @@ class JaxIceHockey(JaxEnvironment):
         )
         return puck.replace(position=pos, velocity=vel)
 
-    def _stick_slot(self, counter: chex.Array) -> chex.Array:
+    def _stick_slot(self, carry_timer: chex.Array) -> chex.Array:
         c = self.consts
-        n = c.STICK_SLOTS
-        # srick cadence schritte alle "STICK_CADENCE" frames
-        phase = (counter // c.STICK_CADENCE) % (
-            2 * (n - 1)
-        )  # 0 .. 2n-3 in unserem Fall 0 - 63
-        slot = (n - 1) - jnp.abs(
-            phase - (n - 1)
-        )  # Dreieck 0..n-1..0 0-30 und dann von 30-0
+        n = c.STICK_SLOTS  # 32
+        phase = (carry_timer // c.STICK_CADENCE) % (2 * n)  # 0..63
+        slot = jnp.where(phase < n, phase, 2 * n - 1 - phase)  # 0..31, 31..0
         return slot.astype(jnp.int32)
 
-    def _carried_puck_pos(self, char, slot, stick_dy):
+    def _visible_stick_pos(self, carry_timer: chex.Array) -> chex.Array:
+        # 8 visible carry positions as their own (coarser, faster) triangle
+        # wave, independent of the fine 32-slot shot-angle wave in
+        # _stick_slot. Same reflecting-triangle shape, so each outer position
+        # (0 and 7) is naturally held for 2 ticks at the turnaround while the
+        # inner ones hold for 1 tick each: 0,1,2,3,4,5,6,7,7,6,5,4,3,2,1,0,...
         c = self.consts
-        center = char.position + jnp.array(
-            [c.PLAYER_W / 2.0, c.PLAYER_H / 2.0], dtype=jnp.float32
-        )
-        t = slot.astype(jnp.float32) / (c.STICK_SLOTS)
-        sign = jnp.where(char.orientation == 1, 1.0, -1.0)
+        n = 8
+        phase = (carry_timer // c.STICK_VISIBLE_CADENCE) % (2 * n)  # 0..15
+        visible = jnp.where(phase < n, phase, 2 * n - 1 - phase)  # 0..7, 7..0
+        return visible.astype(jnp.int32)
+
+    def _carried_puck_pos(self, char, visible, stick_dy):
+        c = self.consts
+        base = jnp.round(char.position)
+        t = visible.astype(jnp.float32) / 7.0
         dx = c.STICK_MIN_DX + t * (c.STICK_MAX_DX - c.STICK_MIN_DX)
-        return center + jnp.array([sign * dx, stick_dy], dtype=jnp.float32)
+        x = jnp.where(
+            char.orientation == 1,
+            base[0] + c.PLAYER_W / 2.0 + dx,
+            base[0] + c.PLAYER_W / 2.0 - dx - c.PUCK_W,
+        )
+        y = base[1] + c.PLAYER_H / 2.0 + stick_dy
+        return jnp.array([x, y], dtype=jnp.float32)
 
     def _check_puck_in_bounding_box(
         self,
@@ -1341,30 +1361,40 @@ class JaxIceHockey(JaxEnvironment):
             puck_state.replace(pickup_blocker=new_pickup_blocker),
         )
 
-    def _puck_carry(
-        self,
-        player_state: PlayerState,
-        enemy_state: EnemyState,
-        puck_state: PuckState,
-        counter: chex.Array,
-    ) -> PuckState:
+    def _puck_carry(self, player_state, enemy_state, puck_state, counter):
         c = self.consts
         p_sk, p_go = player_state.skater, player_state.goalie
         e_sk, e_go = enemy_state.skater, enemy_state.goalie
         anyone_has = p_sk.has_puck | p_go.has_puck | e_sk.has_puck | e_go.has_puck
 
-        slot = self._stick_slot(counter)
+        holder = jnp.where(
+            p_sk.has_puck,
+            0,
+            jnp.where(
+                p_go.has_puck,
+                1,
+                jnp.where(e_sk.has_puck, 2, jnp.where(e_go.has_puck, 3, -1)),
+            ),
+        ).astype(jnp.int32)
+
+        same_holder = holder == puck_state.holder
+        carry_timer = jnp.where(
+            anyone_has & same_holder, puck_state.carry_timer + 1, 0
+        ).astype(jnp.int32)
+
+        slot = self._stick_slot(carry_timer)
+        visible = self._visible_stick_pos(carry_timer)
 
         carry_pos = jnp.where(
             p_sk.has_puck,
-            self._carried_puck_pos(p_sk, slot, stick_dy=c.STICK_DY + 2.0),
+            self._carried_puck_pos(p_sk, visible, stick_dy=c.STICK_DY + 2.0),
             jnp.where(
                 p_go.has_puck,
-                self._carried_puck_pos(p_go, slot, stick_dy=c.STICK_DY + 2.0),
+                self._carried_puck_pos(p_go, visible, stick_dy=c.STICK_DY + 2.0),
                 jnp.where(
                     e_sk.has_puck,
-                    self._carried_puck_pos(e_sk, slot, stick_dy=c.ENEMY_STICK_DY),
-                    self._carried_puck_pos(e_go, slot, stick_dy=c.ENEMY_STICK_DY),
+                    self._carried_puck_pos(e_sk, visible, stick_dy=c.ENEMY_STICK_DY),
+                    self._carried_puck_pos(e_go, visible, stick_dy=c.ENEMY_STICK_DY),
                 ),
             ),
         )
@@ -1375,7 +1405,11 @@ class JaxIceHockey(JaxEnvironment):
             anyone_has, jnp.zeros(2, dtype=jnp.float32), free_puck.velocity
         )
         return puck_state.replace(
-            position=new_puck_pos, velocity=new_puck_vel, position_stick=slot
+            position=new_puck_pos,
+            velocity=new_puck_vel,
+            position_stick=slot,
+            carry_timer=carry_timer,
+            holder=holder,
         )
 
     def _puck_shoot(self, player_state, enemy_state, puck_state):
@@ -1388,16 +1422,12 @@ class JaxIceHockey(JaxEnvironment):
         e_go_shoots = e_go.has_puck & (e_go.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
         should_shoot = sk_shoots | go_shoots | e_sk_shoots | e_go_shoots
 
-        slot = puck_state.position_stick
-        t = slot.astype(jnp.float32) / jnp.float32(c.STICK_SLOTS - 1)
-        phi = (t - 0.5) * jnp.pi
+        slot = puck_state.position_stick  # 0..31
 
         def shot_for(char, team_sign):
-            sign = jnp.where(char.orientation == 1, 1.0, -1.0).astype(jnp.float32)
-            vx = sign * jnp.sin(phi) * c.PUCK_SPEED
-            vy = (
-                team_sign * jnp.cos(phi) * c.PUCK_SPEED
-            )  # Player +1 (runter), Enemy -1 (hoch)
+            s_eff = jnp.where(char.orientation == 1, slot, 31 - slot)
+            vx = (s_eff.astype(jnp.float32) - 16.0) / 8.0
+            vy = team_sign * jnp.float32(c.PUCK_SPEED)
             return jnp.array([vx, vy], dtype=jnp.float32)
 
         shot_vel = jnp.where(
@@ -1500,7 +1530,9 @@ class JaxIceHockey(JaxEnvironment):
         )
 
         # 1) Active-skater resolution (per team, against the shared puck).
-        active_player, active_enemy = self._resolve_active_characters(player_state, enemy_state, puck_position)
+        active_player, active_enemy = self._resolve_active_characters(
+            player_state, enemy_state, puck_position
+        )
 
         # 2) Phase 1 — intended input movement, uniform over each team's two skaters.
         p1, p2 = self._apply_team_inputs(
