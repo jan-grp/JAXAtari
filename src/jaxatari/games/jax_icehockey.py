@@ -252,6 +252,13 @@ class IceHockeyConstants(struct.PyTreeNode):
     ENEMY_STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
     PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
+    # Unit [x, y] direction used to release the puck when the face-off ends.
+    # Keep this direction valid for a normal puck shot; it is scaled by
+    # PUCK_SPEED when applied.
+    FACE_OFF_PUCK_DIRECTION: Tuple[float, float] = struct.field(
+        pytree_node=False, default=(-0.707, 0.707)
+    )
+    FACE_OFF_PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
 
     # Pick up region around the end of the stick in which the puck can be picked up
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
@@ -613,6 +620,17 @@ class JaxIceHockey(JaxEnvironment):
             goal_phase_over,
             lambda: (fo_player, fo_enemy, fo_puck),
             lambda: (player_state, enemy_state, puck_state),
+        )
+
+        # The face-off countdown holds the puck still. Release it when that countdown ends; 
+        # movement begins next frame.
+        faceoff_launch_velocity = jnp.asarray(
+            c.FACE_OFF_PUCK_DIRECTION, dtype=jnp.float32
+        ) * jnp.float32(c.FACE_OFF_PUCK_SPEED)
+        puck_state = puck_state.replace(
+            velocity=jnp.where(
+                faceoff_over, faceoff_launch_velocity, puck_state.velocity
+            )
         )
 
         game_state = game_state.replace(
