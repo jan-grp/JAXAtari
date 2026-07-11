@@ -1527,10 +1527,9 @@ class JaxIceHockey(JaxEnvironment):
         min_vertical_distance = jnp.float32(c.MIN_VERTICAL_DISTANCE)
         x_min = c.RINK_LEFT
         x_max = c.RINK_RIGHT - c.PLAYER_W
-        y_top = c.RINK_TOP
+        y_top = c.RINK_TOP - c.PLAYER_H + 9
         y_bot = c.RINK_BOTTOM - c.PLAYER_H
         off = c.ATTACKING_ZONE_OFFSET_Y  # depth of the restricted zone
-        crease = c.GOALIE_CREASE_DEPTH  # how far a goalie pokes into its goal
         # Player defends the TOP goal, enemy the BOTTOM. A skater is kept out of its
         # own defensive zone (so it plays toward the goal it attacks); a goalie stays
         # in its defensive half but may enter its own goal crease.
@@ -1538,13 +1537,13 @@ class JaxIceHockey(JaxEnvironment):
             [x_min, x_max, y_top + off, y_bot], dtype=jnp.float32
         )
         bounds_player_goalie = jnp.array(
-            [x_min, x_max, y_top - crease, y_bot - off], dtype=jnp.float32
+            [x_min, x_max, y_top, y_bot - off], dtype=jnp.float32
         )
         bounds_enemy_skater = jnp.array(
             [x_min, x_max, y_top, y_bot - off], dtype=jnp.float32
         )
         bounds_enemy_goalie = jnp.array(
-            [x_min, x_max, y_top + off, y_bot + crease], dtype=jnp.float32
+            [x_min, x_max, y_top + off, y_bot], dtype=jnp.float32
         )
 
         # 1) Active-skater resolution (per team, against the shared puck).
