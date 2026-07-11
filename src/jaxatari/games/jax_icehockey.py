@@ -251,14 +251,16 @@ class IceHockeyConstants(struct.PyTreeNode):
 
     ENEMY_STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
-    PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
+    PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=2)
+    PUCK_MIN_SPEED: float = struct.field(pytree_node=False, default=1.4)
+    PUCK_FRICTION_COEFF: float = struct.field(pytree_node=False, default=0.9995)
     # Unit [x, y] direction used to release the puck when the face-off ends.
     # Keep this direction valid for a normal puck shot; it is scaled by
-    # PUCK_SPEED when applied.
+    # PUCK_MAX_SPEED when applied.
     FACE_OFF_PUCK_DIRECTION: Tuple[float, float] = struct.field(
         pytree_node=False, default=(-0.707, 0.707)
     )
-    FACE_OFF_PUCK_SPEED: float = struct.field(pytree_node=False, default=2)
+    FACE_OFF_PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=2)
 
     # Pick up region around the end of the stick in which the puck can be picked up
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
@@ -626,7 +628,7 @@ class JaxIceHockey(JaxEnvironment):
         # movement begins next frame.
         faceoff_launch_velocity = jnp.asarray(
             c.FACE_OFF_PUCK_DIRECTION, dtype=jnp.float32
-        ) * jnp.float32(c.FACE_OFF_PUCK_SPEED)
+        ) * jnp.float32(c.FACE_OFF_PUCK_MAX_SPEED)
         puck_state = puck_state.replace(
             velocity=jnp.where(
                 faceoff_over, faceoff_launch_velocity, puck_state.velocity
@@ -1244,6 +1246,12 @@ class JaxIceHockey(JaxEnvironment):
         vx = jnp.where(hit_left | hit_right, -vel[0], vel[0])
         vy = jnp.where(hit_top | hit_bot, -vel[1], vel[1])
         vel = jnp.array([vx, vy], dtype=jnp.float32)
+        
+        # apply friction
+        current_speed = jnp.linalg.norm(vel)
+        fric_coeff = jnp.where(current_speed > c.PUCK_MIN_SPEED, c.PUCK_FRICTION_COEFF, 1.0)
+        vel = vel * fric_coeff
+        # vel = jnp.clip(vel, c.PUCK_MIN_SPEED, c.PUCK_MAX_SPEED)
 
         pos = jnp.clip(
             tentative,
@@ -1445,7 +1453,7 @@ class JaxIceHockey(JaxEnvironment):
         def shot_for(char, team_sign):
             s_eff = jnp.where(char.orientation == 1, slot, 31 - slot)
             vx = (s_eff.astype(jnp.float32) - 16.0) / 8.0
-            vy = team_sign * jnp.float32(c.PUCK_SPEED)
+            vy = team_sign * jnp.float32(c.PUCK_MAX_SPEED)
             return jnp.array([vx, vy], dtype=jnp.float32)
 
         shot_vel = jnp.where(
