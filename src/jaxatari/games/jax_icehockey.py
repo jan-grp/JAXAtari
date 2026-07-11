@@ -424,7 +424,7 @@ class JaxIceHockey(JaxEnvironment):
             return CharacterState(
                 is_tackled=jnp.array(False),
                 position=jnp.array([x, y], dtype=jnp.float32),
-                orientation=jnp.array(0, dtype=jnp.int32),
+                orientation=jnp.array(orientation, dtype=jnp.int32),
                 has_puck=jnp.array(False),
                 shooting_cooldown=jnp.array(0, dtype=jnp.int32),
                 walk_counter=jnp.array(0, dtype=jnp.int32),
