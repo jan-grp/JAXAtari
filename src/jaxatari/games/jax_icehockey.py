@@ -227,6 +227,28 @@ class IceHockeyConstants(struct.PyTreeNode):
     # freeze after a goal before everyone snaps back to the face-off spots
     GOAL_PAUSE_FRAMES: int = struct.field(pytree_node=False, default=64)
 
+    # Enemy AI (PLACEHOLDERS to calibrate against the original computer player):
+    #   - ENEMY_SHOOT_DIST: shoot once the carrier is within this many pixels
+    #     (vertically) of the player's goal line. Observed on the original: the AI
+    #     skates in very close before it shoots.
+    #   - ENEMY_AIM_TOL: how many stick slots off the ideal angle a shot may be.
+    #   - ENEMY_AIM_NOISE: random slot error added to every shot and pass. An angular
+    #     error misses by more the further out it is fired from, which reproduces the
+    #     original: it nearly always scores from close in, but sprays from distance.
+    #   - ENEMY_DEADBAND: how far off target the AI tolerates before it steers.
+    #   - ENEMY_ZIGZAG_PERIOD: frames per diagonal leg while carrying. The original's
+    #     carrier only ever moves diagonally, so to gain ground toward the goal it has
+    #     to alternate up-left / up-right - that alternation is the visible zigzag.
+    #   - ENEMY_TACKLES: whether the AI attempts body-checks at all. It is
+    #     unverified whether the original computer opponent ever knocks the
+    #     player's skaters down - set False if it never does.
+    ENEMY_SHOOT_DIST: float = struct.field(pytree_node=False, default=18.0)
+    ENEMY_AIM_TOL: int = struct.field(pytree_node=False, default=1)
+    ENEMY_AIM_NOISE: int = struct.field(pytree_node=False, default=2)
+    ENEMY_DEADBAND: float = struct.field(pytree_node=False, default=3.0)
+    ENEMY_ZIGZAG_PERIOD: int = struct.field(pytree_node=False, default=12)
+    ENEMY_TACKLES: bool = struct.field(pytree_node=False, default=True)
+
     # Face-off layout. [x, y] = [col, row].
     FACEOFF_X: float = struct.field(pytree_node=False, default=79.0)
     FACEOFF_Y: float = struct.field(pytree_node=False, default=114.0)
@@ -505,11 +527,12 @@ class JaxIceHockey(JaxEnvironment):
                 new_player_state, new_enemy_state, state.puck_state
             )
 
-            # Tackle: the player's active skater can body-check an enemy with FIRE.
+            # Tackle: either team's active character can body-check on a swing.
             new_player_state, new_enemy_state = self._tackle_step(
                 new_player_state,
                 new_enemy_state,
                 player_action,
+                enemy_action,
                 tackle_key,
             )
 
@@ -556,8 +579,258 @@ class JaxIceHockey(JaxEnvironment):
         info = self._get_info(state)
         return obs, state, reward, done, info
 
+    def _aim_slot(self, origin, target, orientation, team_sign):
+        """Stick slot whose shot angle sends the puck from `origin` toward `target`.
+
+        _puck_shoot builds the shot purely from the slot the puck sits on:
+            phi = (slot / (STICK_SLOTS - 1) - 0.5) * pi
+            vx  = sign      * sin(phi) * PUCK_SPEED   (sign = +1 facing right, else -1)
+            vy  = team_sign * cos(phi) * PUCK_SPEED   (player +1 = down, enemy -1 = up)
+        Inverting that for a wanted unit direction u gives
+            sin(phi) = u.x * sign        cos(phi) = u.y * team_sign
+        so phi = atan2(u.x*sign, u.y*team_sign) and
+            slot = (phi/pi + 0.5) * (STICK_SLOTS - 1).
+
+        cos(phi) >= 0 is required, i.e. the target must lie forward (toward the goal
+        this team attacks) - the original only allows forward shots too, so a backward
+        target simply cannot be aimed at. `forward` reports whether it can.
+        """
+        c = self.consts
+        d = target - origin
+        norm = jnp.maximum(jnp.sqrt(jnp.sum(d ** 2)), 1e-6)
+        u = d / norm
+        sign = jnp.where(orientation == 1, 1.0, -1.0).astype(jnp.float32)
+        phi = jnp.arctan2(u[0] * sign, u[1] * team_sign)
+        slot = jnp.round((phi / jnp.pi + 0.5) * (c.STICK_SLOTS - 1))
+        slot = jnp.clip(slot, 0, c.STICK_SLOTS - 1).astype(jnp.int32)
+        return slot, (u[1] * team_sign) > 0.05
+
     def _enemy_policy(self, state: IceHockeyState) -> chex.Array:
-        return jnp.array(Action.NOOP, dtype=jnp.int32)
+        """Rule-based controller for the enemy's active character (one action/frame).
+
+        The shot angle comes solely from which stick slot the puck sits on when FIRE is
+        pressed (see _puck_shoot), so the AI works out the slot that points at its
+        target and waits for the puck to reach it. Firing whenever it is merely allowed
+        to - without checking the slot - sends the puck off at whatever angle the stick
+        happens to be at, which just sprays it into the boards.
+
+        Modes:
+          * carrying, skater -> close in on the goal, then shoot once lined up.
+          * carrying, goalie -> PASS to the skater. A goalie can never reach the
+            opposing goal (its own bounds plus the same-team spacing hold it back), so
+            gating its shot on a distance to that goal would leave it holding the puck
+            forever. Passing out of the back half is what the original does, and the
+            manual calls goalie->forward passing a core skill.
+          * otherwise -> skate at the PUCK, whoever holds it. The GameFAQs guide states
+            the original AI simply goes after the puck's location. Swing inside
+            TACKLE_RANGE to check the carrier (only if ENEMY_TACKLES).
+        """
+        c = self.consts
+        es = state.enemy_state
+        active_is_goalie = es.active_character == 1
+        active = jax.lax.cond(
+            es.active_character == 0, lambda: es.skater, lambda: es.goalie
+        )
+        pos = active.position
+        team_sign = jnp.float32(-1.0)  # the enemy attacks the TOP goal
+
+        p_sk = state.player_state.skater
+        p_go = state.player_state.goalie
+        player_has = p_sk.has_puck | p_go.has_puck
+        carrier_pos = jnp.where(p_sk.has_puck, p_sk.position, p_go.position)
+
+        carrying = active.has_puck
+        can_swing = active.shooting_cooldown == 0
+
+        # ---------------- where to move ----------------
+        # Carrying: head for the goal, but keep the current x as long as it is inside
+        # the goal mouth. That leaves the horizontal channel free for the zigzag below,
+        # and the shot may come in at an angle anyway, so there is no one exact x to
+        # walk to.
+        carry_x = jnp.clip(
+            pos[0],
+            jnp.float32(c.GOAL_X0) - c.PLAYER_W / 2.0,
+            jnp.float32(c.GOAL_X1) - c.PLAYER_W / 2.0,
+        )
+        carry_target = jnp.array([carry_x, jnp.float32(c.PLAYER_GOAL_Y)])
+
+        # Not carrying: go to the puck. Aim the stick pickup box at it, not the sprite
+        # corner, so the stick actually reaches the puck.
+        chase_target = state.puck_state.position - jnp.array(
+            [
+                c.PICKUP_BOX_W / 2.0,
+                c.ENEMY_PICKUP_BOX_OFFSET_Y + c.PICKUP_BOX_H / 2.0,
+            ],
+            dtype=jnp.float32,
+        )
+        target = jnp.where(carrying, carry_target, chase_target)
+
+        delta = target - pos
+        dead = c.ENEMY_DEADBAND
+        dx = jnp.where(delta[0] > dead, 1, jnp.where(delta[0] < -dead, -1, 0)).astype(
+            jnp.int32
+        )
+        dy = jnp.where(delta[1] > dead, 1, jnp.where(delta[1] < -dead, -1, 0)).astype(
+            jnp.int32
+        )
+
+        # ---------------- checking ----------------
+        dist_carrier_sq = jnp.sum((carrier_pos - pos) ** 2)
+        want_tackle = (
+                player_has
+                & jnp.logical_not(carrying)
+                & (dist_carrier_sq <= jnp.float32(c.TACKLE_RANGE) ** 2)
+                & jnp.array(c.ENEMY_TACKLES)
+                & can_swing
+        )
+        # A check only lands while pushing INTO the victim, so steer at the carrier's
+        # body (not at the puck beside it) and drop the deadband, or the AI can stall
+        # just short of contact and never connect.
+        to_carrier = carrier_pos - pos
+        dx = jnp.where(want_tackle, jnp.sign(to_carrier[0]).astype(jnp.int32), dx)
+        dy = jnp.where(want_tackle, jnp.sign(to_carrier[1]).astype(jnp.int32), dy)
+
+        # ---------------- the zigzag ----------------
+        # Observed on the original: a carrier only ever moves DIAGONALLY - it never
+        # skates straight up the ice, and never purely sideways. To still gain ground it
+        # has to alternate up-left / up-right, and that alternation is the zigzag. Off
+        # the puck it chases in straight lines, so this only applies while carrying.
+        # Whenever an axis would be zero here it is forced: the horizontal one flips
+        # every ENEMY_ZIGZAG_PERIOD frames (the zigzag itself), the vertical one keeps
+        # pressing toward the goal.
+        zig = jnp.where(
+            (state.counter // c.ENEMY_ZIGZAG_PERIOD) % 2 == 0, 1, -1
+        ).astype(jnp.int32)
+        dx = jnp.where(carrying & (dx == 0), zig, dx)
+        # Vertical while carrying:
+        #   still closing in -> press toward the goal every frame,
+        #   already in shooting range -> alternate on the same slow zigzag period, so
+        #     it holds station in front of the net while it waits for the stick slot to
+        #     come round.
+        # Steering at a stand-off POINT instead makes it overshoot by a fraction of a
+        # pixel and get pulled straight back, i.e. it vibrates up/down every frame (the
+        # stutter). Pressing up unconditionally is no good either: the skater's bounds
+        # let it go PAST the goal line, and once its centre is level with the line no
+        # forward shot angle is left at all, so it would hold the puck forever.
+        in_range = pos[1] <= jnp.float32(c.PLAYER_GOAL_Y) + c.ENEMY_SHOOT_DIST
+        dy = jnp.where(carrying, jnp.where(in_range, -zig, jnp.int32(-1)), dy)
+
+        # ---------------- aiming ----------------
+        # The slot the puck sits on this frame. _puck_carry recomputes it from the same
+        # (pre-increment) counter and _puck_shoot reads exactly that, so this is the
+        # angle a shot fired right now would really take.
+        slot_now = self._stick_slot(state.counter)
+        # Aim for the state the character will be in AFTER this frame's move: the shot's
+        # horizontal sign is read from `orientation`, which flips with horizontal input,
+        # and the carrier is always moving diagonally now. Aiming from the pre-move
+        # orientation would mirror every shot fired on a frame that turns the skater.
+        new_orient = jnp.where(dx > 0, 1, jnp.where(dx < 0, 0, active.orientation))
+        new_pos = pos + jnp.array([dx, dy], dtype=jnp.float32) * c.PLAYER_SPEED
+        # Aim from the character's centre, NOT from the carried puck: the puck's spot on
+        # the stick is itself a function of the slot, so aiming from it would make the
+        # wanted slot depend on the current slot - a moving target that never settles.
+        origin = new_pos + jnp.array(
+            [c.PLAYER_W / 2.0, c.PLAYER_H / 2.0], dtype=jnp.float32
+        )
+        goal_point = jnp.array(
+            [(c.GOAL_X0 + c.GOAL_X1) / 2.0, jnp.float32(c.PLAYER_GOAL_Y)]
+        )
+
+        # Aim error, re-drawn once per stick sweep so it stays stable long enough to
+        # line a shot up. This is what makes the AI miss sometimes instead of being a
+        # perfect sniper, and it also stops it repeating one identical shot forever.
+        sweep = state.counter // (2 * (c.STICK_SLOTS - 1))
+        slot_err = jrandom.randint(
+            jrandom.fold_in(state.rng, sweep),
+            shape=(),
+            minval=-c.ENEMY_AIM_NOISE,
+            maxval=c.ENEMY_AIM_NOISE + 1,
+        )
+
+        slot_pass, fwd_pass = self._aim_slot(
+            origin, es.skater.position, new_orient, team_sign
+        )
+        slot_goal, fwd_goal = self._aim_slot(
+            origin, goal_point, new_orient, team_sign
+        )
+        use_pass = active_is_goalie & fwd_pass
+        aim_slot = jnp.clip(
+            jnp.where(use_pass, slot_pass, slot_goal) + slot_err,
+            0,
+            c.STICK_SLOTS - 1,
+        )
+        aim_ok = jnp.where(use_pass, fwd_pass, fwd_goal)
+
+        shot_gate = active_is_goalie | in_range  # the goalie may pass from anywhere
+        lined_up = jnp.abs(slot_now - aim_slot) <= c.ENEMY_AIM_TOL
+        want_shot = carrying & aim_ok & shot_gate & lined_up & can_swing
+
+        return self._compose_action(dx, dy, want_shot | want_tackle)
+
+    def _compose_action(
+            self, dx: chex.Array, dy: chex.Array, fire: chex.Array
+    ) -> chex.Array:
+        """Map (dx, dy in {-1, 0, 1}, fire) onto the matching ALE action integer."""
+        table = jnp.array(
+            [
+                [
+                    [Action.UPLEFT, Action.UPLEFTFIRE],
+                    [Action.UP, Action.UPFIRE],
+                    [Action.UPRIGHT, Action.UPRIGHTFIRE],
+                ],
+                [
+                    [Action.LEFT, Action.LEFTFIRE],
+                    [Action.NOOP, Action.FIRE],
+                    [Action.RIGHT, Action.RIGHTFIRE],
+                ],
+                [
+                    [Action.DOWNLEFT, Action.DOWNLEFTFIRE],
+                    [Action.DOWN, Action.DOWNFIRE],
+                    [Action.DOWNRIGHT, Action.DOWNRIGHTFIRE],
+                ],
+            ],
+            dtype=jnp.int32,
+        )
+        return table[dy + 1, dx + 1, fire.astype(jnp.int32)]
+
+    def _action_move_dir(self, action: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        """Intended movement direction encoded in an action (mirrors _apply_action)."""
+        a = action
+        move_right = jnp.any(
+            jnp.array(
+                [
+                    a == Action.RIGHT, a == Action.UPRIGHT, a == Action.DOWNRIGHT,
+                    a == Action.RIGHTFIRE, a == Action.UPRIGHTFIRE, a == Action.DOWNRIGHTFIRE,
+                ]
+            )
+        )
+        move_left = jnp.any(
+            jnp.array(
+                [
+                    a == Action.LEFT, a == Action.UPLEFT, a == Action.DOWNLEFT,
+                    a == Action.LEFTFIRE, a == Action.UPLEFTFIRE, a == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        move_down = jnp.any(
+            jnp.array(
+                [
+                    a == Action.DOWN, a == Action.DOWNRIGHT, a == Action.DOWNLEFT,
+                    a == Action.DOWNFIRE, a == Action.DOWNRIGHTFIRE, a == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        move_up = jnp.any(
+            jnp.array(
+                [
+                    a == Action.UP, a == Action.UPRIGHT, a == Action.UPLEFT,
+                    a == Action.UPFIRE, a == Action.UPRIGHTFIRE, a == Action.UPLEFTFIRE,
+                ]
+            )
+        )
+        move_dx = jnp.where(move_right, 1.0, jnp.where(move_left, -1.0, 0.0))
+        move_dy = jnp.where(move_down, 1.0, jnp.where(move_up, -1.0, 0.0))
+        return move_dx, move_dy
 
     def _goal_and_reset_step(
         self,
@@ -667,161 +940,129 @@ class JaxIceHockey(JaxEnvironment):
         return near_line & in_mouth
 
     def _tackle_step(
-        self,
-        player_state: PlayerState,
-        enemy_state: EnemyState,
-        player_action: chex.Array,
-        key: chex.PRNGKey,
+            self,
+            player_state: PlayerState,
+            enemy_state: EnemyState,
+            player_action: chex.Array,
+            enemy_action: chex.Array,
+            key: chex.PRNGKey,
     ) -> Tuple[PlayerState, EnemyState]:
-        """Resolve the player's body-check against the enemy team for one frame.
+        """Resolve both teams' body-checks for one frame.
 
-        The player's ACTIVE skater, on a FIRE press, knocks down the nearest
-        eligible enemy if within TACKLE_RANGE and a random roll succeeds. The enemy
-        goalie is immune while in its crease. Then every character's tackle timer
-        is ticked down (which also clears is_tackled when it expires).
+        Each team's ACTIVE character can, on a fresh swing while pushing toward an
+        opponent within TACKLE_RANGE, knock that opponent down with probability
+        TACKLE_SUCCESS_PROB. A knocked-down character drops the puck on the spot
+        and is frozen for a random TACKLE_FRAMES_MIN..MAX frames. Goalies are
+        immune inside their own crease. The enemy side only attempts tackles when
+        ENEMY_TACKLES is set (whether the original computer opponent tackles at
+        all is unverified). Afterwards every character's tackle timer ticks down.
 
         Pushing a downed character is unaffected here: that is handled positionally
         in _separate_opponents and is intentionally left enabled.
         """
         c = self.consts
 
-        # The player's tackler is whichever player character is active (closest to puck).
-        attacker = jax.lax.cond(
-            player_state.active_character == 0,
-            lambda: player_state.skater,
-            lambda: player_state.goalie,
-        )
-        attacker_pos = attacker.position
+        def attempt(att_sk, att_go, att_active, action, def_sk, def_go, def_goal_y, k):
+            attacker = jax.lax.cond(att_active == 0, lambda: att_sk, lambda: att_go)
+            attacker_pos = attacker.position
 
-        # One tackle attempt PER SWING. _characters_step has already run this frame,
-        # so a swing just started exactly when the attacker's shooting_cooldown was
-        # (re)set to its max. Holding FIRE replays the swing every SHOOT_ANIM_FRAMES,
-        # so each swing is one attempt.
-        swing_started = attacker.shooting_cooldown == self.consts.SHOOT_ANIM_FRAMES
+            # One attempt PER SWING: a swing just started exactly when the
+            # attacker's shooting_cooldown was (re)set to its max this frame.
+            swing_started = attacker.shooting_cooldown == c.SHOOT_ANIM_FRAMES
 
-        # Intended movement direction from this frame's action (mirrors _apply_action):
-        # the tackle only lands when the attacker is pushing TOWARD the victim, not when
-        # standing still or skating away.
-        a = player_action
-        move_right = jnp.any(
-            jnp.array(
-                [
-                    a == Action.RIGHT,
-                    a == Action.UPRIGHT,
-                    a == Action.DOWNRIGHT,
-                    a == Action.RIGHTFIRE,
-                    a == Action.UPRIGHTFIRE,
-                    a == Action.DOWNRIGHTFIRE,
-                ]
+            # The tackle only lands when the attacker is pushing TOWARD the victim.
+            move_dx, move_dy = self._action_move_dir(action)
+            moving = (move_dx != 0.0) | (move_dy != 0.0)
+
+            # Distance (centre-to-centre, matching the collision model).
+            d_skater = jnp.sum((def_sk.position - attacker_pos) ** 2)
+            d_goalie = jnp.sum((def_go.position - attacker_pos) ** 2)
+            range_sq = c.TACKLE_RANGE ** 2
+
+            goalie_safe = self._goalie_protected(def_go.position, def_goal_y)
+
+            skater_hittable = (d_skater <= range_sq) & jnp.logical_not(def_sk.is_tackled)
+            goalie_hittable = (
+                    (d_goalie <= range_sq)
+                    & jnp.logical_not(def_go.is_tackled)
+                    & jnp.logical_not(goalie_safe)
             )
-        )
-        move_left = jnp.any(
-            jnp.array(
-                [
-                    a == Action.LEFT,
-                    a == Action.UPLEFT,
-                    a == Action.DOWNLEFT,
-                    a == Action.LEFTFIRE,
-                    a == Action.UPLEFTFIRE,
-                    a == Action.DOWNLEFTFIRE,
-                ]
+
+            # Pick the closer eligible target (prefer the skater on a tie).
+            target_is_skater = skater_hittable & (
+                    (d_skater <= d_goalie) | jnp.logical_not(goalie_hittable)
             )
-        )
-        move_down = jnp.any(
-            jnp.array(
-                [
-                    a == Action.DOWN,
-                    a == Action.DOWNRIGHT,
-                    a == Action.DOWNLEFT,
-                    a == Action.DOWNFIRE,
-                    a == Action.DOWNRIGHTFIRE,
-                    a == Action.DOWNLEFTFIRE,
-                ]
+            target_is_goalie = goalie_hittable & jnp.logical_not(target_is_skater)
+            any_target = target_is_skater | target_is_goalie
+
+            target_pos = jnp.where(target_is_skater, def_sk.position, def_go.position)
+            to_target = target_pos - attacker_pos
+            moving_toward = moving & (
+                    (move_dx * to_target[0] + move_dy * to_target[1]) > 0.0
             )
-        )
-        move_up = jnp.any(
-            jnp.array(
-                [
-                    a == Action.UP,
-                    a == Action.UPRIGHT,
-                    a == Action.UPLEFT,
-                    a == Action.UPFIRE,
-                    a == Action.UPRIGHTFIRE,
-                    a == Action.UPLEFTFIRE,
-                ]
+
+            # One roll per swing.
+            roll = jrandom.uniform(k)
+            success = (
+                    swing_started & any_target & moving_toward & (roll < c.TACKLE_SUCCESS_PROB)
             )
-        )
-        move_dx = jnp.where(move_right, 1.0, jnp.where(move_left, -1.0, 0.0))
-        move_dy = jnp.where(move_down, 1.0, jnp.where(move_up, -1.0, 0.0))
-        moving = (move_dx != 0.0) | (move_dy != 0.0)
+            dur = jrandom.randint(
+                k, shape=(), minval=c.TACKLE_FRAMES_MIN, maxval=c.TACKLE_FRAMES_MAX + 1
+            )
 
-        # Distance (centre-to-centre, matching the collision model) to each enemy.
-        d_skater = jnp.sum((enemy_state.skater.position - attacker_pos) ** 2)
-        d_goalie = jnp.sum((enemy_state.goalie.position - attacker_pos) ** 2)
-        range_sq = c.TACKLE_RANGE**2
+            def knock_down(char: CharacterState) -> CharacterState:
+                # Going down also means losing the puck on the spot.
+                return char.replace(
+                    tackle_timer=dur,
+                    is_tackled=jnp.array(True),
+                    has_puck=jnp.array(False),
+                )
 
-        # Enemy goalie is immune while guarding its goal (enemy defends the BOTTOM).
-        goalie_safe = self._goalie_protected(
-            enemy_state.goalie.position, jnp.float32(c.ENEMY_GOAL_Y)
-        )
+            new_def_sk = jax.lax.cond(
+                success & target_is_skater, knock_down, lambda ch: ch, def_sk
+            )
+            new_def_go = jax.lax.cond(
+                success & target_is_goalie, knock_down, lambda ch: ch, def_go
+            )
+            return new_def_sk, new_def_go
 
-        # A target is hittable if in range, not already tackled, and (for the goalie)
-        # not protected.
-        skater_hittable = (d_skater <= range_sq) & jnp.logical_not(
-            enemy_state.skater.is_tackled
-        )
-        goalie_hittable = (
-            (d_goalie <= range_sq)
-            & jnp.logical_not(enemy_state.goalie.is_tackled)
-            & jnp.logical_not(goalie_safe)
-        )
+        key_player, key_enemy = jrandom.split(key)
 
-        # Pick the closer eligible target (prefer the skater on a tie).
-        target_is_skater = skater_hittable & (
-            (d_skater <= d_goalie) | jnp.logical_not(goalie_hittable)
-        )
-        target_is_goalie = goalie_hittable & jnp.logical_not(target_is_skater)
-        any_target = target_is_skater | target_is_goalie
-
-        # Vector from attacker to the chosen target, and whether movement points at it.
-        target_pos = jnp.where(
-            target_is_skater, enemy_state.skater.position, enemy_state.goalie.position
-        )
-        to_target = target_pos - attacker_pos
-        # Positive dot product => moving toward the target (pushing into them).
-        moving_toward = moving & (
-            (move_dx * to_target[0] + move_dy * to_target[1]) > 0.0
+        # Player's active character checks the enemy team (enemy goal = bottom).
+        new_e_sk, new_e_go = attempt(
+            player_state.skater,
+            player_state.goalie,
+            player_state.active_character,
+            player_action,
+            enemy_state.skater,
+            enemy_state.goalie,
+            jnp.float32(c.ENEMY_GOAL_Y),
+            key_player,
         )
 
-        # One roll per swing (see swing_started above).
-        roll = jrandom.uniform(key)
-        success = (
-            swing_started & any_target & moving_toward & (roll < c.TACKLE_SUCCESS_PROB)
-        )
-
-        # Random stun duration in [TACKLE_FRAMES_MIN, TACKLE_FRAMES_MAX].
-        dur = jrandom.randint(
-            key, shape=(), minval=c.TACKLE_FRAMES_MIN, maxval=c.TACKLE_FRAMES_MAX + 1
-        )
-
-        def knock_down(char: CharacterState) -> CharacterState:
-            return char.replace(tackle_timer=dur, is_tackled=jnp.array(True))
-
-        new_enemy_skater = jax.lax.cond(
-            success & target_is_skater, knock_down, lambda ch: ch, enemy_state.skater
-        )
-        new_enemy_goalie = jax.lax.cond(
-            success & target_is_goalie, knock_down, lambda ch: ch, enemy_state.goalie
-        )
+        # Enemy's active character checks the player team (player goal = top).
+        if c.ENEMY_TACKLES:
+            new_p_sk, new_p_go = attempt(
+                enemy_state.skater,
+                enemy_state.goalie,
+                enemy_state.active_character,
+                enemy_action,
+                player_state.skater,
+                player_state.goalie,
+                jnp.float32(c.PLAYER_GOAL_Y),
+                key_enemy,
+            )
+        else:
+            new_p_sk, new_p_go = player_state.skater, player_state.goalie
 
         # Tick all four timers down by one frame (clears is_tackled on expiry).
         new_player_state = player_state.replace(
-            skater=self._decrement_tackle(player_state.skater),
-            goalie=self._decrement_tackle(player_state.goalie),
+            skater=self._decrement_tackle(new_p_sk),
+            goalie=self._decrement_tackle(new_p_go),
         )
         new_enemy_state = enemy_state.replace(
-            skater=self._decrement_tackle(new_enemy_skater),
-            goalie=self._decrement_tackle(new_enemy_goalie),
+            skater=self._decrement_tackle(new_e_sk),
+            goalie=self._decrement_tackle(new_e_go),
         )
         return new_player_state, new_enemy_state
 
