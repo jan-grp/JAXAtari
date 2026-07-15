@@ -49,6 +49,7 @@ GAME_MODULES = {
     # "hangman": "jaxatari.games.jax_hangman",
     "hauntedhouse": "jaxatari.games.jax_hauntedhouse",
     "humancannonball": "jaxatari.games.jax_humancannonball",
+    "icehockey": "jaxatari.games.jax_icehockey",
     "kangaroo": "jaxatari.games.jax_kangaroo",
     "kingkong": "jaxatari.games.jax_kingkong",
     # "klax": "jaxatari.games.jax_klax",
@@ -105,7 +106,8 @@ MOD_MODULES = {
     "spaceinvaders": "jaxatari.games.mods.spaceinvaders_mods.SpaceInvadersEnvMod",
     "skiing": "jaxatari.games.mods.skiing_mods.SkiingEnvMod",
     "alien": "jaxatari.games.mods.alien_mods.AlienEnvMod",
-    "asteroids": "jaxatari.games.mods.asteroids_mods.AsteroidsEnvMod"
+    "asteroids": "jaxatari.games.mods.asteroids_mods.AsteroidsEnvMod",
+    "icehockey": "jaxatari.games.mods.icehockey_mods.IceHockeyEnvMod"
 }
 
 
