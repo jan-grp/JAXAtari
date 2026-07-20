@@ -578,7 +578,9 @@ class JaxIceHockey(JaxEnvironment):
             | enemy_state.skater.has_puck
             | enemy_state.goalie.has_puck
         )
-        in_mouth = (puck_pos[0] >= c.GOAL_X0) & (puck_pos[0] <= c.GOAL_X1)
+        # GOAL_X0 and GOAL_X1 are rigid post pixels.  Only the open interval
+        # between them is a scoring mouth.
+        in_mouth = (puck_pos[0] > c.GOAL_X0) & (puck_pos[0] < c.GOAL_X1)
         player_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] >= c.ENEMY_GOAL_Y)
         enemy_scored = ~frozen & ~carried & in_mouth & (puck_pos[1] <= c.PLAYER_GOAL_Y)
         goal = player_scored | enemy_scored
@@ -1234,30 +1236,75 @@ class JaxIceHockey(JaxEnvironment):
     # ------------------------------------------------------------------ #
     # Orchestrator — runs phase 1 then phase 2 for all four characters
     # ------------------------------------------------------------------ #
-    def _puck_step(self, puck: PuckState) -> PuckState:
+    def _advance_puck_with_walls(
+        self, position: chex.Array, velocity: chex.Array
+    ) -> Tuple[chex.Array, chex.Array]:
+        """Advance a puck and resolve the rink boards and rigid goal posts.
+
+        The goal-post pixels use the same clamp-and-reflect rule as the outer
+        rink walls.  Their vertical span is the rink-facing ``GOAL_HEIGHT``
+        pixels at the top and bottom board, while ``GOAL_X0`` and ``GOAL_X1``
+        are the left and right post pixels respectively.
+        """
         c = self.consts
-        tentative = puck.position + puck.velocity
-        vel = puck.velocity
+        tentative = position + velocity
+
         hit_left = tentative[0] < c.RINK_LEFT
         hit_right = tentative[0] > c.RINK_RIGHT
         hit_top = tentative[1] < c.RINK_TOP
-        hit_bot = tentative[1] > c.RINK_BOTTOM
+        hit_bottom = tentative[1] > c.RINK_BOTTOM
+        resolved_y = jnp.clip(tentative[1], c.RINK_TOP, c.RINK_BOTTOM)
 
-        vx = jnp.where(hit_left | hit_right, -vel[0], vel[0])
-        vy = jnp.where(hit_top | hit_bot, -vel[1], vel[1])
-        vel = jnp.array([vx, vy], dtype=jnp.float32)
-        
+        # A GOAL_HEIGHT-pixel segment includes its board pixel, so its inward
+        # extent is GOAL_HEIGHT - 1.  A post only blocks a puck entering the
+        # goal mouth from its corresponding outside side; this mirrors the
+        # outer-board convention, which permits occupying a wall pixel and
+        # reflects only on the attempted step beyond it.
+        post_depth = c.GOAL_HEIGHT - 1
+        in_top_post_band = (resolved_y >= c.RINK_TOP) & (
+            resolved_y <= c.RINK_TOP + post_depth
+        )
+        in_bottom_post_band = (resolved_y >= c.RINK_BOTTOM - post_depth) & (
+            resolved_y <= c.RINK_BOTTOM
+        )
+        in_post_band = in_top_post_band | in_bottom_post_band
+        hit_goal_left = (
+            in_post_band
+            & (position[0] <= c.GOAL_X0)
+            & (tentative[0] > c.GOAL_X0)
+        )
+        hit_goal_right = (
+            in_post_band
+            & (position[0] >= c.GOAL_X1)
+            & (tentative[0] < c.GOAL_X1)
+        )
+
+        vx = jnp.where(
+            hit_left | hit_right | hit_goal_left | hit_goal_right,
+            -velocity[0],
+            velocity[0],
+        )
+        vy = jnp.where(hit_top | hit_bottom, -velocity[1], velocity[1])
+
+        board_x = jnp.clip(tentative[0], c.RINK_LEFT, c.RINK_RIGHT)
+        resolved_x = jnp.where(
+            hit_goal_left,
+            jnp.float32(c.GOAL_X0),
+            jnp.where(hit_goal_right, jnp.float32(c.GOAL_X1), board_x),
+        )
+        resolved_position = jnp.array([resolved_x, resolved_y], dtype=jnp.float32)
+        resolved_velocity = jnp.array([vx, vy], dtype=jnp.float32)
+        return resolved_position, resolved_velocity
+
+    def _puck_step(self, puck: PuckState) -> PuckState:
+        c = self.consts
+        pos, vel = self._advance_puck_with_walls(puck.position, puck.velocity)
+
         # apply friction
         current_speed = jnp.linalg.norm(vel)
         fric_coeff = jnp.where(current_speed > c.PUCK_MIN_SPEED, c.PUCK_FRICTION_COEFF, 1.0)
         vel = vel * fric_coeff
         # vel = jnp.clip(vel, c.PUCK_MIN_SPEED, c.PUCK_MAX_SPEED)
-
-        pos = jnp.clip(
-            tentative,
-            jnp.array([float(c.RINK_LEFT), float(c.RINK_TOP)]),
-            jnp.array([float(c.RINK_RIGHT), float(c.RINK_BOTTOM)]),
-        )
         return puck.replace(position=pos, velocity=vel)
 
     def _stick_slot(self, carry_timer: chex.Array) -> chex.Array:
@@ -1465,9 +1512,14 @@ class JaxIceHockey(JaxEnvironment):
                 jnp.where(e_sk_shoots, shot_for(e_sk, -1.0), shot_for(e_go, -1.0)),
             ),
         )
-        new_velocity = jnp.where(should_shoot, shot_vel, puck_state.velocity)
+        shot_position, bounced_shot_velocity = self._advance_puck_with_walls(
+            puck_state.position, shot_vel
+        )
+        new_velocity = jnp.where(
+            should_shoot, bounced_shot_velocity, puck_state.velocity
+        )
         new_position = jnp.where(
-            should_shoot, puck_state.position + shot_vel, puck_state.position
+            should_shoot, shot_position, puck_state.position
         )
         shooter_index = jnp.where(
             sk_shoots,
