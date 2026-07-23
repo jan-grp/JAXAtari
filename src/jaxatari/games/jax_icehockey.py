@@ -293,6 +293,7 @@ class GameState:
 class CharacterState:
     is_tackled: chex.Array
     position: chex.Array  # float32 [x, y]
+    velocity: chex.Array  # float32 [vx, vy]; unused by the base game, available to mods
     orientation: chex.Array  # 0 = left, 1 = right
     has_puck: chex.Array
     shooting_cooldown: chex.Array
@@ -424,6 +425,7 @@ class JaxIceHockey(JaxEnvironment):
             return CharacterState(
                 is_tackled=jnp.array(False),
                 position=jnp.array([x, y], dtype=jnp.float32),
+                velocity=jnp.zeros(2, dtype=jnp.float32),
                 orientation=jnp.array(orientation, dtype=jnp.int32),
                 has_puck=jnp.array(False),
                 shooting_cooldown=jnp.array(0, dtype=jnp.int32),

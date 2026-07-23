@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxatari.modification import JaxAtariInternalModPlugin
+from jaxatari.environment import JAXAtariAction as Action
 
 
 def _goal_offset_x(consts, remaining_time, amplitude, speed=0.15):
@@ -253,3 +254,131 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         raster = jr.draw_rects(raster, open_positions, open_sizes, board_id)
 
         return raster
+
+
+class PlayerSlidingMod(JaxAtariInternalModPlugin):
+
+    # Closer to 1.0 = slides longer and resists direction changes more.
+    FRICTION_COEFF = 0.92
+    MIN_SLIDE_SPEED = 0.15
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _apply_action(self, character, action, bounds, velocity):
+        up = jnp.any(
+            jnp.array(
+                [
+                    action == Action.UP,
+                    action == Action.UPRIGHT,
+                    action == Action.UPLEFT,
+                    action == Action.UPFIRE,
+                    action == Action.UPRIGHTFIRE,
+                    action == Action.UPLEFTFIRE,
+                ]
+            )
+        )
+        down = jnp.any(
+            jnp.array(
+                [
+                    action == Action.DOWN,
+                    action == Action.DOWNRIGHT,
+                    action == Action.DOWNLEFT,
+                    action == Action.DOWNFIRE,
+                    action == Action.DOWNRIGHTFIRE,
+                    action == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        left = jnp.any(
+            jnp.array(
+                [
+                    action == Action.LEFT,
+                    action == Action.UPLEFT,
+                    action == Action.DOWNLEFT,
+                    action == Action.LEFTFIRE,
+                    action == Action.UPLEFTFIRE,
+                    action == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        right = jnp.any(
+            jnp.array(
+                [
+                    action == Action.RIGHT,
+                    action == Action.UPRIGHT,
+                    action == Action.DOWNRIGHT,
+                    action == Action.RIGHTFIRE,
+                    action == Action.UPRIGHTFIRE,
+                    action == Action.DOWNRIGHTFIRE,
+                ]
+            )
+        )
+
+        # A tackled character is frozen: ignore input and kill any glide outright.
+        movable = jnp.logical_not(character.is_tackled)
+
+        # Target velocity from raw input: full speed on a pressed axis, else 0.
+        # Note this is the same target regardless of the character's *current*
+        # velocity, so pressing the opposite direction targets -velocity even while
+        # still sliding the old way — the blend below is what makes that a slide
+        # instead of an instant reversal.
+        target_vx = jnp.where(right, velocity, jnp.where(left, -velocity, 0.0))
+        target_vy = jnp.where(down, velocity, jnp.where(up, -velocity, 0.0))
+        target = jnp.array([target_vx, target_vy], dtype=jnp.float32)
+
+        # Blend current velocity toward the target (exponential decay of the
+        # difference, same shape as the puck's friction). Once within
+        # MIN_SLIDE_SPEED of the target, snap to it exactly so the character
+        # doesn't asymptotically creep forever.
+        blended = target + (character.velocity - target) * self.FRICTION_COEFF
+        residual = jnp.linalg.norm(blended - target)
+        settled_velocity = jnp.where(residual > self.MIN_SLIDE_SPEED, blended, target)
+
+        new_velocity = jnp.where(
+            movable, settled_velocity, jnp.zeros(2, dtype=jnp.float32)
+        )
+
+        new_x = jnp.clip(character.position[0] + new_velocity[0], bounds[0], bounds[1])
+        new_y = jnp.clip(character.position[1] + new_velocity[1], bounds[2], bounds[3])
+        new_position = jnp.array([new_x, new_y])
+
+        # Orientation: 0 = facing left, 1 = facing right. Input keeps the current
+        # facing; a tackled character keeps it too (frozen).
+        new_orientation = jnp.where(
+            movable & right, 1, jnp.where(movable & left, 0, character.orientation)
+        )
+
+        # Leg walk-cycle advances whenever the character is actually moving
+        # (either from input or still gliding) and freezes once it comes to rest.
+        has_motion = movable & (jnp.linalg.norm(new_velocity) > self.MIN_SLIDE_SPEED)
+        new_walk_counter = jnp.where(has_motion, character.walk_counter + 1, 0)
+
+        # Shooting/swing animation (unchanged from the base game).
+        fire = movable & jnp.any(
+            jnp.array(
+                [
+                    action == Action.FIRE,
+                    action == Action.UPFIRE,
+                    action == Action.DOWNFIRE,
+                    action == Action.LEFTFIRE,
+                    action == Action.RIGHTFIRE,
+                    action == Action.UPRIGHTFIRE,
+                    action == Action.UPLEFTFIRE,
+                    action == Action.DOWNRIGHTFIRE,
+                    action == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        decremented = jnp.maximum(character.shooting_cooldown - 1, 0)
+        new_cooldown = jnp.where(
+            fire & (character.shooting_cooldown == 0),
+            self._env.consts.SHOOT_ANIM_FRAMES,
+            decremented,
+        )
+
+        return character.replace(
+            position=new_position,
+            velocity=new_velocity,
+            orientation=new_orientation,
+            walk_counter=new_walk_counter,
+            shooting_cooldown=new_cooldown,
+        )
