@@ -1742,8 +1742,16 @@ class IceHockeyRenderer(JAXGameRenderer):
         ) = self.jr.load_and_setup_assets(final_asset_config, self.sprite_path)
 
     @partial(jax.jit, static_argnums=(0,))
+    def _render_hook_post_background(
+        self, raster: jnp.ndarray, state: IceHockeyState
+    ) -> jnp.ndarray:
+        """No-op hook for mods to redraw the ice/boards before objects are stamped."""
+        return raster
+
+    @partial(jax.jit, static_argnums=(0,))
     def render(self, state: IceHockeyState) -> jnp.ndarray:
         raster = self.jr.create_object_raster(self.BACKGROUND)
+        raster = self._render_hook_post_background(raster, state)
 
         puck_m = self.SHAPE_MASKS["puck"]
 

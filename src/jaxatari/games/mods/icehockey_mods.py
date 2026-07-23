@@ -1,6 +1,9 @@
 import os
 from jaxatari.modification import JaxAtariModController
-from jaxatari.games.mods.icehockey.icehockey_mod_plugins import ChangeBorderShapeMod
+from jaxatari.games.mods.icehockey.icehockey_mod_plugins import (
+    ChangeBorderShapeMod,
+    MovingGoalsMod,
+)
 
 
 class IceHockeyEnvMod(JaxAtariModController):
@@ -11,6 +14,7 @@ class IceHockeyEnvMod(JaxAtariModController):
 
     REGISTRY = {
         "change_border_shape": ChangeBorderShapeMod,
+        "moving_goals": MovingGoalsMod,
     }
 
     _mod_sprite_dir = os.path.join(os.path.dirname(__file__), "icehockey", "sprites")
