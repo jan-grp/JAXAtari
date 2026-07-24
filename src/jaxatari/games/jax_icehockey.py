@@ -668,6 +668,66 @@ class JaxIceHockey(JaxEnvironment):
         )
         return near_line & in_mouth
 
+    def _action_direction_flags(
+        self, action: chex.Array
+    ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+        """Classify an action into absolute-screen (up, down, left, right) presses.
+
+        Shared by _apply_action (movement) and _tackle_step (tackle-direction
+        check): both need the same action -> direction classification, but apply
+        it differently downstream (velocity-scaled + tackled-gated displacement
+        vs. a unit sign used in a dot-product test).
+        """
+        up = jnp.any(
+            jnp.array(
+                [
+                    action == Action.UP,
+                    action == Action.UPRIGHT,
+                    action == Action.UPLEFT,
+                    action == Action.UPFIRE,
+                    action == Action.UPRIGHTFIRE,
+                    action == Action.UPLEFTFIRE,
+                ]
+            )
+        )
+        down = jnp.any(
+            jnp.array(
+                [
+                    action == Action.DOWN,
+                    action == Action.DOWNRIGHT,
+                    action == Action.DOWNLEFT,
+                    action == Action.DOWNFIRE,
+                    action == Action.DOWNRIGHTFIRE,
+                    action == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        left = jnp.any(
+            jnp.array(
+                [
+                    action == Action.LEFT,
+                    action == Action.UPLEFT,
+                    action == Action.DOWNLEFT,
+                    action == Action.LEFTFIRE,
+                    action == Action.UPLEFTFIRE,
+                    action == Action.DOWNLEFTFIRE,
+                ]
+            )
+        )
+        right = jnp.any(
+            jnp.array(
+                [
+                    action == Action.RIGHT,
+                    action == Action.UPRIGHT,
+                    action == Action.DOWNRIGHT,
+                    action == Action.RIGHTFIRE,
+                    action == Action.UPRIGHTFIRE,
+                    action == Action.DOWNRIGHTFIRE,
+                ]
+            )
+        )
+        return up, down, left, right
+
     def _tackle_step(
         self,
         player_state: PlayerState,
@@ -704,54 +764,8 @@ class JaxIceHockey(JaxEnvironment):
         # Intended movement direction from this frame's action (mirrors _apply_action):
         # the tackle only lands when the attacker is pushing TOWARD the victim, not when
         # standing still or skating away.
-        a = player_action
-        move_right = jnp.any(
-            jnp.array(
-                [
-                    a == Action.RIGHT,
-                    a == Action.UPRIGHT,
-                    a == Action.DOWNRIGHT,
-                    a == Action.RIGHTFIRE,
-                    a == Action.UPRIGHTFIRE,
-                    a == Action.DOWNRIGHTFIRE,
-                ]
-            )
-        )
-        move_left = jnp.any(
-            jnp.array(
-                [
-                    a == Action.LEFT,
-                    a == Action.UPLEFT,
-                    a == Action.DOWNLEFT,
-                    a == Action.LEFTFIRE,
-                    a == Action.UPLEFTFIRE,
-                    a == Action.DOWNLEFTFIRE,
-                ]
-            )
-        )
-        move_down = jnp.any(
-            jnp.array(
-                [
-                    a == Action.DOWN,
-                    a == Action.DOWNRIGHT,
-                    a == Action.DOWNLEFT,
-                    a == Action.DOWNFIRE,
-                    a == Action.DOWNRIGHTFIRE,
-                    a == Action.DOWNLEFTFIRE,
-                ]
-            )
-        )
-        move_up = jnp.any(
-            jnp.array(
-                [
-                    a == Action.UP,
-                    a == Action.UPRIGHT,
-                    a == Action.UPLEFT,
-                    a == Action.UPFIRE,
-                    a == Action.UPRIGHTFIRE,
-                    a == Action.UPLEFTFIRE,
-                ]
-            )
+        move_up, move_down, move_left, move_right = self._action_direction_flags(
+            player_action
         )
         move_dx = jnp.where(move_right, 1.0, jnp.where(move_left, -1.0, 0.0))
         move_dy = jnp.where(move_down, 1.0, jnp.where(move_up, -1.0, 0.0))
@@ -940,54 +954,7 @@ class JaxIceHockey(JaxEnvironment):
         Returns:
             The updated ``CharacterState`` (position + orientation; other fields kept).
         """
-        up = jnp.any(
-            jnp.array(
-                [
-                    action == Action.UP,
-                    action == Action.UPRIGHT,
-                    action == Action.UPLEFT,
-                    action == Action.UPFIRE,
-                    action == Action.UPRIGHTFIRE,
-                    action == Action.UPLEFTFIRE,
-                ]
-            )
-        )
-        down = jnp.any(
-            jnp.array(
-                [
-                    action == Action.DOWN,
-                    action == Action.DOWNRIGHT,
-                    action == Action.DOWNLEFT,
-                    action == Action.DOWNFIRE,
-                    action == Action.DOWNRIGHTFIRE,
-                    action == Action.DOWNLEFTFIRE,
-                ]
-            )
-        )
-        left = jnp.any(
-            jnp.array(
-                [
-                    action == Action.LEFT,
-                    action == Action.UPLEFT,
-                    action == Action.DOWNLEFT,
-                    action == Action.LEFTFIRE,
-                    action == Action.UPLEFTFIRE,
-                    action == Action.DOWNLEFTFIRE,
-                ]
-            )
-        )
-        right = jnp.any(
-            jnp.array(
-                [
-                    action == Action.RIGHT,
-                    action == Action.UPRIGHT,
-                    action == Action.DOWNRIGHT,
-                    action == Action.RIGHTFIRE,
-                    action == Action.UPRIGHTFIRE,
-                    action == Action.DOWNRIGHTFIRE,
-                ]
-            )
-        )
+        up, down, left, right = self._action_direction_flags(action)
 
         # A tackled character is frozen: ignore all input movement this frame.
         movable = jnp.logical_not(character.is_tackled)
