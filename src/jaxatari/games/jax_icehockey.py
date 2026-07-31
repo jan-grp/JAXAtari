@@ -550,8 +550,32 @@ class JaxIceHockey(JaxEnvironment):
             rng=rng,
         )
 
+        # game over: the step after done=True starts a fresh match
+        def restart_match(_):
+            fo_player, fo_enemy, fo_puck = self._faceoff_positions()
+            return state.replace(
+                player_state=fo_player,
+                enemy_state=fo_enemy,
+                puck_state=fo_puck,
+                game_state=GameState(
+                    pause_counter=jnp.array(
+                        self.consts.FACE_OFF_FRAMES, dtype=jnp.int32
+                    ),
+                    player_score=jnp.array(0, dtype=jnp.int32),
+                    enemy_score=jnp.array(0, dtype=jnp.int32),
+                    remaining_time=jnp.array(self.consts.TIME_LIMIT, dtype=jnp.int32),
+                    is_faceoff=jnp.array(True),
+                    goal_scored=jnp.array(False),
+                    is_finished=jnp.array(False),
+                ),
+            )
+
+        state = jax.lax.cond(gs.is_finished, restart_match, lambda _: state, None)
+
         obs = self._get_observation(state)
         reward = self._get_reward(previous_state, state)
+        # the score reset at match restart must not count as reward
+        reward = jnp.where(gs.is_finished, 0.0, reward)
         done = self._get_done(state)
         info = self._get_info(state)
         return obs, state, reward, done, info
