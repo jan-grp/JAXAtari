@@ -1984,14 +1984,16 @@ class IceHockeyRenderer(JAXGameRenderer):
     # Palette-based renderer. The rink (boards, lines, goals, score bars) is
     # baked into the background, so render() only stamps the moving objects.
 
-    def __init__(self, consts: Optional[IceHockeyConstants] = None):
+    def __init__(
+        self,
+        consts: Optional[IceHockeyConstants] = None,
+        config: Optional[render_utils.RendererConfig] = None,
+    ):
         self.consts = consts or IceHockeyConstants()
         super().__init__(self.consts)
 
-        self.config = render_utils.RendererConfig(
-            game_dimensions=(210, 160),
-            channels=3,
-            downscale=None,
+        self.config = config or render_utils.RendererConfig(
+            game_dimensions=(210, 160), channels=3, downscale=None
         )
         self.jr = render_utils.JaxRenderingUtils(self.config)
 
