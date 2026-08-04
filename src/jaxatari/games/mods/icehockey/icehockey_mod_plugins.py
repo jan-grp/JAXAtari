@@ -3,7 +3,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from jaxatari.modification import JaxAtariInternalModPlugin
+from jaxatari.modification import JaxAtariInternalModPlugin, JaxAtariPostStepModPlugin
 from jaxatari.environment import JAXAtariAction as Action
 
 
@@ -382,3 +382,65 @@ class PlayerSlidingMod(JaxAtariInternalModPlugin):
             walk_counter=new_walk_counter,
             shooting_cooldown=new_cooldown,
         )
+
+
+class EnemySpeedUpMod(JaxAtariPostStepModPlugin):
+    """Enemy skaters get progressively faster every time the player scores.
+
+    Runs after the base step, which has already moved every character at the
+    fixed base speed and resolved this frame's goal/reset logic. Rather than
+    reaching into how speed is computed internally, this takes the enemy
+    characters' already-computed per-frame displacement (new position minus
+    previous position -- naturally zero while frozen/tackled/stationary) and
+    stretches it by an extra factor derived from the player's cumulative
+    goal count, then re-clips to the same zone bounds ``_characters_step``
+    uses. This deliberately avoids ``CharacterState.velocity``, which
+    ``PlayerSlidingMod`` repurposes for actual sliding physics, so the two
+    mods don't fight over the same storage.
+    """
+
+    SPEED_INCREASE_PER_GOAL = 0.15  # +15% enemy speed per player goal
+    MAX_SPEED_MULTIPLIER = 2.5  # cap so it stays playable at high scores
+
+    @partial(jax.jit, static_argnums=(0,))
+    def run(self, prev_state, new_state):
+        c = self._env.consts
+
+        multiplier = jnp.minimum(
+            1.0
+            + self.SPEED_INCREASE_PER_GOAL
+            * new_state.game_state.player_score.astype(jnp.float32),
+            jnp.float32(self.MAX_SPEED_MULTIPLIER),
+        )
+        extra_scale = multiplier - 1.0
+
+        x_min = c.RINK_LEFT
+        x_max = c.RINK_RIGHT - c.PLAYER_W
+        y_top = c.RINK_TOP - c.PLAYER_H + 9
+        y_bot = c.RINK_BOTTOM - c.PLAYER_H
+        off = c.ATTACKING_ZONE_OFFSET_Y
+
+        def boosted(prev_char, new_char, y_lo, y_hi):
+            delta = new_char.position - prev_char.position
+            pos = new_char.position + delta * extra_scale
+            x = jnp.clip(pos[0], x_min, x_max)
+            y = jnp.clip(pos[1], y_lo, y_hi)
+            return new_char.replace(position=jnp.array([x, y], dtype=jnp.float32))
+
+        new_skater = boosted(
+            prev_state.enemy_state.skater,
+            new_state.enemy_state.skater,
+            y_top,
+            y_bot - off,
+        )
+        new_goalie = boosted(
+            prev_state.enemy_state.goalie,
+            new_state.enemy_state.goalie,
+            y_top + off,
+            y_bot,
+        )
+
+        new_enemy_state = new_state.enemy_state.replace(
+            skater=new_skater, goalie=new_goalie
+        )
+        return new_state.replace(enemy_state=new_enemy_state)
