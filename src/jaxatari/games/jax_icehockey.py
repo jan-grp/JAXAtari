@@ -221,12 +221,12 @@ class IceHockeyConstants(struct.PyTreeNode):
     # PLACEHOLDER values to verify against the ROM (via RAMStateDeltas):
     #   - range: how close (pixels, centre-to-centre) the victim must be.
     #   - prob: success chance per SWING (while in range AND pushing toward the
-    #     victim; 0.333 = easy to test).
+    #     victim; 0.33333 = easy to test).
     #   - min/max frames: stun duration in game frames (= step() calls), drawn
     #     uniformly in [min, max]. Calibrate against ROM frames at frameskip=1
     #     (playback rate like play.py's 30 fps does NOT change frame counts).
     TACKLE_RANGE: float = struct.field(pytree_node=False, default=18.0)
-    TACKLE_SUCCESS_PROB: float = struct.field(pytree_node=False, default=0.33333)
+    TACKLE_SUCCESS_PROB: float = struct.field(pytree_node=False, default=0.2)
     TACKLE_FRAMES_MIN: int = struct.field(pytree_node=False, default=60)
     TACKLE_FRAMES_MAX: int = struct.field(pytree_node=False, default=120)
 
@@ -252,9 +252,9 @@ class IceHockeyConstants(struct.PyTreeNode):
     #   - ENEMY_TACKLES: whether the AI attempts body-checks at all. It is
     #     unverified whether the original computer opponent ever knocks the
     #     player's skaters down - set False if it never does.
-    ENEMY_SHOOT_DIST: float = struct.field(pytree_node=False, default=18.0)
-    ENEMY_AIM_TOL: int = struct.field(pytree_node=False, default=0)
-    ENEMY_AIM_NOISE: int = struct.field(pytree_node=False, default=1)
+    ENEMY_SHOOT_DIST: float = struct.field(pytree_node=False, default=25.0)
+    ENEMY_AIM_TOL: int = struct.field(pytree_node=False, default=2)
+    ENEMY_AIM_NOISE: int = struct.field(pytree_node=False, default=0)
     ENEMY_DEADBAND: float = struct.field(pytree_node=False, default=3.0)
     ENEMY_ZIGZAG_PERIOD: int = struct.field(pytree_node=False, default=12)
     ENEMY_TACKLES: bool = struct.field(pytree_node=False, default=True)
@@ -664,23 +664,38 @@ class JaxIceHockey(JaxEnvironment):
         )
         carry_target = jnp.array([carry_x, jnp.float32(c.PLAYER_GOAL_Y)])
 
-        # Not carrying: go to the puck. Aim the stick pickup box at it, not the sprite
-        # corner, so the stick actually reaches the puck.
-        chase_target = state.puck_state.position - jnp.array(
-            [
-                c.PICKUP_BOX_W / 2.0,
-                c.ENEMY_PICKUP_BOX_OFFSET_Y + c.PICKUP_BOX_H / 2.0,
-            ],
-            dtype=jnp.float32,
-        )
-        target = jnp.where(carrying, carry_target, chase_target)
+        # Not carrying: drive the PICKUP BOX onto the puck. The box is a fixed offset
+        # from the body - sideways by orientation (0 facing left, 9 facing right) and
+        # ENEMY_PICKUP_BOX_OFFSET_Y below - so the body must sit so that box lands on
+        # the puck. Aiming at one fixed point then stopping inside a deadband is what
+        # strands the AI next to (or just past) a loose puck: whenever the puck falls in
+        # the offset dead-zone - directly below the body, or hard against a wall where
+        # the box cannot be pushed further - the target is essentially where the body
+        # already is, the deadband zeroes the input, and it stops with the puck just
+        # outside the box.
+        box_off_x = jnp.where(
+            active.orientation == 0,
+            c.PICKUP_BOX_OFFSET_X_LEFT,
+            c.PICKUP_BOX_OFFSET_X_RIGHT,
+        ) + c.PICKUP_BOX_W / 2.0
+        box_off_y = c.ENEMY_PICKUP_BOX_OFFSET_Y + c.PICKUP_BOX_H / 2.0
+        box_center = pos + jnp.array([box_off_x, box_off_y], dtype=jnp.float32)
+        to_puck = state.puck_state.position - box_center
+        half = jnp.array([c.PICKUP_BOX_W / 2.0, c.PICKUP_BOX_H / 2.0], dtype=jnp.float32)
 
-        delta = target - pos
+        delta = jnp.where(carrying, carry_target - pos, to_puck)
         dead = c.ENEMY_DEADBAND
-        dx = jnp.where(delta[0] > dead, 1, jnp.where(delta[0] < -dead, -1, 0)).astype(
+        # While chasing, only stop on an axis once the puck is already inside the box on
+        # that axis; otherwise keep nudging even for sub-deadband gaps, so it never
+        # freezes a couple of pixels short. While carrying, keep the old deadband feel.
+        in_box_x = jnp.abs(to_puck[0]) <= half[0]
+        in_box_y = jnp.abs(to_puck[1]) <= half[1]
+        dead_x = jnp.where(carrying, dead, jnp.where(in_box_x, dead, 0.0))
+        dead_y = jnp.where(carrying, dead, jnp.where(in_box_y, dead, 0.0))
+        dx = jnp.where(delta[0] > dead_x, 1, jnp.where(delta[0] < -dead_x, -1, 0)).astype(
             jnp.int32
         )
-        dy = jnp.where(delta[1] > dead, 1, jnp.where(delta[1] < -dead, -1, 0)).astype(
+        dy = jnp.where(delta[1] > dead_y, 1, jnp.where(delta[1] < -dead_y, -1, 0)).astype(
             jnp.int32
         )
 
@@ -1146,8 +1161,10 @@ class JaxIceHockey(JaxEnvironment):
 
         # Player defends TOP (mirror of the enemy).
         def player_fallback_active() -> chex.Array:
-            p_skater_high = (y_top + c.ATTACKING_ZONE_OFFSET_Y) - box_off  # skater's highest box
-            p_goalie_low = (y_bot - c.GOALIE_FORWARD_OFFSET) - box_off     # goalie's lowest box
+            # The pickup box hangs BELOW the sprite position for both teams, so the box
+            # offset is ADDED here too - it is not mirrored with the team's direction.
+            p_skater_high = (y_top + c.ATTACKING_ZONE_OFFSET_Y) + box_off  # skater's highest box
+            p_goalie_low = (y_bot - c.GOALIE_FORWARD_OFFSET) + box_off  # goalie's lowest box
             only_goalie = puck_y < p_skater_high
             only_skater = puck_y > p_goalie_low
             return jnp.where(
