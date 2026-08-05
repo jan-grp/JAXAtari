@@ -195,13 +195,23 @@ class IceHockeyConstants(struct.PyTreeNode):
     # Offset from the goal lines defining zone where goalie/skater can't move.
     # A skater is kept out of its own defensive zone (this deep); a goalie is kept
     # out of the opponent's far zone (this deep).
-    ATTACKING_ZONE_OFFSET_Y: int = struct.field(pytree_node=False, default=30)
+    # Skater's own-goal margin, measured at the PICKUP BOX: the forward's stick is
+    # kept ~35% of the rink from its own goal (manual: "prevented from moving too
+    # close to his own goal"). Box-referenced so the active-zone test below lines up
+    # with where the stick can actually collect the puck.
+    ATTACKING_ZONE_OFFSET_Y: int = struct.field(pytree_node=False, default=47)
+    # Goalie's forward limit, also at the pickup box: its stick may leave its own goal
+    # up to ~65% of the rink (manual: "can go only so far away from his goal").
+    GOALIE_FORWARD_OFFSET: int = struct.field(pytree_node=False, default=46)
     # How far a goalie may poke into its own goal crease (beyond the rink edge).
     GOALIE_CREASE_DEPTH: int = struct.field(pytree_node=False, default=6)
 
     # Phase-2 collision tunables for _characters_step
     MIN_SEPARATION: float = struct.field(pytree_node=False, default=8.0)
-    MIN_VERTICAL_DISTANCE: float = struct.field(pytree_node=False, default=40.0)
+    # Minimum vertical gap between two same-team players (and between the two goalies
+    # of opposing teams), ~30% of the rink, measured top-left corner to top-left
+    # corner. The passive player is pushed vertically to keep this gap.
+    MIN_VERTICAL_DISTANCE: float = struct.field(pytree_node=False, default=44.0)
 
     STICK_VISIBLE_CADENCE: int = struct.field(pytree_node=False, default=4)
 
@@ -211,12 +221,12 @@ class IceHockeyConstants(struct.PyTreeNode):
     # PLACEHOLDER values to verify against the ROM (via RAMStateDeltas):
     #   - range: how close (pixels, centre-to-centre) the victim must be.
     #   - prob: success chance per SWING (while in range AND pushing toward the
-    #     victim; 0.333 = easy to test).
+    #     victim; 0.33333 = easy to test).
     #   - min/max frames: stun duration in game frames (= step() calls), drawn
     #     uniformly in [min, max]. Calibrate against ROM frames at frameskip=1
     #     (playback rate like play.py's 30 fps does NOT change frame counts).
     TACKLE_RANGE: float = struct.field(pytree_node=False, default=18.0)
-    TACKLE_SUCCESS_PROB: float = struct.field(pytree_node=False, default=0.33333)
+    TACKLE_SUCCESS_PROB: float = struct.field(pytree_node=False, default=0.2)
     TACKLE_FRAMES_MIN: int = struct.field(pytree_node=False, default=60)
     TACKLE_FRAMES_MAX: int = struct.field(pytree_node=False, default=120)
 
@@ -242,9 +252,9 @@ class IceHockeyConstants(struct.PyTreeNode):
     #   - ENEMY_TACKLES: whether the AI attempts body-checks at all. It is
     #     unverified whether the original computer opponent ever knocks the
     #     player's skaters down - set False if it never does.
-    ENEMY_SHOOT_DIST: float = struct.field(pytree_node=False, default=18.0)
-    ENEMY_AIM_TOL: int = struct.field(pytree_node=False, default=1)
-    ENEMY_AIM_NOISE: int = struct.field(pytree_node=False, default=2)
+    ENEMY_SHOOT_DIST: float = struct.field(pytree_node=False, default=25.0)
+    ENEMY_AIM_TOL: int = struct.field(pytree_node=False, default=2)
+    ENEMY_AIM_NOISE: int = struct.field(pytree_node=False, default=0)
     ENEMY_DEADBAND: float = struct.field(pytree_node=False, default=3.0)
     ENEMY_ZIGZAG_PERIOD: int = struct.field(pytree_node=False, default=12)
     ENEMY_TACKLES: bool = struct.field(pytree_node=False, default=True)
@@ -315,6 +325,7 @@ class GameState:
 class CharacterState:
     is_tackled: chex.Array
     position: chex.Array  # float32 [x, y]
+    velocity: chex.Array  # float32 [vx, vy]; unused by the base game, available to mods
     orientation: chex.Array  # 0 = left, 1 = right
     has_puck: chex.Array
     shooting_cooldown: chex.Array
@@ -449,6 +460,7 @@ class JaxIceHockey(JaxEnvironment):
             return CharacterState(
                 is_tackled=jnp.array(False),
                 position=jnp.array([x, y], dtype=jnp.float32),
+                velocity=jnp.zeros(2, dtype=jnp.float32),
                 orientation=jnp.array(orientation, dtype=jnp.int32),
                 has_puck=jnp.array(False),
                 shooting_cooldown=jnp.array(0, dtype=jnp.int32),
@@ -658,23 +670,38 @@ class JaxIceHockey(JaxEnvironment):
         )
         carry_target = jnp.array([carry_x, jnp.float32(c.PLAYER_GOAL_Y)])
 
-        # Not carrying: go to the puck. Aim the stick pickup box at it, not the sprite
-        # corner, so the stick actually reaches the puck.
-        chase_target = state.puck_state.position - jnp.array(
-            [
-                c.PICKUP_BOX_W / 2.0,
-                c.ENEMY_PICKUP_BOX_OFFSET_Y + c.PICKUP_BOX_H / 2.0,
-            ],
-            dtype=jnp.float32,
-        )
-        target = jnp.where(carrying, carry_target, chase_target)
+        # Not carrying: drive the PICKUP BOX onto the puck. The box is a fixed offset
+        # from the body - sideways by orientation (0 facing left, 9 facing right) and
+        # ENEMY_PICKUP_BOX_OFFSET_Y below - so the body must sit so that box lands on
+        # the puck. Aiming at one fixed point then stopping inside a deadband is what
+        # strands the AI next to (or just past) a loose puck: whenever the puck falls in
+        # the offset dead-zone - directly below the body, or hard against a wall where
+        # the box cannot be pushed further - the target is essentially where the body
+        # already is, the deadband zeroes the input, and it stops with the puck just
+        # outside the box.
+        box_off_x = jnp.where(
+            active.orientation == 0,
+            c.PICKUP_BOX_OFFSET_X_LEFT,
+            c.PICKUP_BOX_OFFSET_X_RIGHT,
+        ) + c.PICKUP_BOX_W / 2.0
+        box_off_y = c.ENEMY_PICKUP_BOX_OFFSET_Y + c.PICKUP_BOX_H / 2.0
+        box_center = pos + jnp.array([box_off_x, box_off_y], dtype=jnp.float32)
+        to_puck = state.puck_state.position - box_center
+        half = jnp.array([c.PICKUP_BOX_W / 2.0, c.PICKUP_BOX_H / 2.0], dtype=jnp.float32)
 
-        delta = target - pos
+        delta = jnp.where(carrying, carry_target - pos, to_puck)
         dead = c.ENEMY_DEADBAND
-        dx = jnp.where(delta[0] > dead, 1, jnp.where(delta[0] < -dead, -1, 0)).astype(
+        # While chasing, only stop on an axis once the puck is already inside the box on
+        # that axis; otherwise keep nudging even for sub-deadband gaps, so it never
+        # freezes a couple of pixels short. While carrying, keep the old deadband feel.
+        in_box_x = jnp.abs(to_puck[0]) <= half[0]
+        in_box_y = jnp.abs(to_puck[1]) <= half[1]
+        dead_x = jnp.where(carrying, dead, jnp.where(in_box_x, dead, 0.0))
+        dead_y = jnp.where(carrying, dead, jnp.where(in_box_y, dead, 0.0))
+        dx = jnp.where(delta[0] > dead_x, 1, jnp.where(delta[0] < -dead_x, -1, 0)).astype(
             jnp.int32
         )
-        dy = jnp.where(delta[1] > dead, 1, jnp.where(delta[1] < -dead, -1, 0)).astype(
+        dy = jnp.where(delta[1] > dead_y, 1, jnp.where(delta[1] < -dead_y, -1, 0)).astype(
             jnp.int32
         )
 
@@ -1116,14 +1143,6 @@ class JaxIceHockey(JaxEnvironment):
             dist_sq = jnp.sum((centers - puck_position) ** 2, axis=-1)
             return jnp.argmin(dist_sq).astype(jnp.int32)
 
-        puck_in_player_goal_zone = (
-            puck_position[1]
-            <= c.PLAYER_GOAL_Y + c.ATTACKING_ZONE_OFFSET_Y + c.PLAYER_H - 2
-        )
-        puck_in_enemy_goal_zone = (
-            puck_position[1] >= c.ENEMY_GOAL_Y - c.ATTACKING_ZONE_OFFSET_Y + 2
-        )
-
         def resolve_team_active(
             skater: CharacterState,
             goalie: CharacterState,
@@ -1140,34 +1159,43 @@ class JaxIceHockey(JaxEnvironment):
                 operand=None,
             )
 
-        def player_fallback_active() -> chex.Array:
-            return jax.lax.cond(
-                puck_in_player_goal_zone,
-                lambda _: jnp.int32(1),  # player goalie
-                lambda _: jax.lax.cond(
-                    puck_in_enemy_goal_zone,
-                    lambda __: jnp.int32(0),  # player skater
-                    lambda __: closest_character(
-                        player_state.skater, player_state.goalie
-                    ),
-                    operand=None,
-                ),
-                operand=None,
+        # Control goes to the player CLOSEST to the puck (manual: "always the player
+        # closest to the puck") - EXCEPT in the top/bottom margins, where only one of
+        # the two can physically reach. There, the reachable player is active even if
+        # it is the further of the pair; otherwise the closer-but-bounded-out player is
+        # handed control and freezes at its limit while the puck sits untouched.
+        # The boundaries are the pickup-box reach (same reference as the margins), so a
+        # player is only made active where its stick can actually collect the puck.
+        y_top = c.RINK_TOP - c.PLAYER_H + 9
+        y_bot = c.RINK_BOTTOM - c.PLAYER_H
+        box_off = c.ENEMY_PICKUP_BOX_OFFSET_Y + c.PICKUP_BOX_H / 2.0
+        skater_box_deep = (y_bot - c.ATTACKING_ZONE_OFFSET_Y) + box_off  # skater's deepest box
+        goalie_box_high = (y_top + c.GOALIE_FORWARD_OFFSET) + box_off    # goalie's highest box
+        puck_y = puck_position[1]
+
+        # Enemy defends BOTTOM: puck below skater's reach -> only goalie; puck above
+        # goalie's reach -> only skater; between -> closest.
+        def enemy_fallback_active() -> chex.Array:
+            only_goalie = puck_y > skater_box_deep
+            only_skater = puck_y < goalie_box_high
+            return jnp.where(
+                only_goalie, jnp.int32(1),
+                jnp.where(only_skater, jnp.int32(0),
+                          closest_character(enemy_state.skater, enemy_state.goalie)),
             )
 
-        def enemy_fallback_active() -> chex.Array:
-            return jax.lax.cond(
-                puck_in_player_goal_zone,
-                lambda _: jnp.int32(0),  # enemy skater
-                lambda _: jax.lax.cond(
-                    puck_in_enemy_goal_zone,
-                    lambda __: jnp.int32(1),  # enemy goalie
-                    lambda __: closest_character(
-                        enemy_state.skater, enemy_state.goalie
-                    ),
-                    operand=None,
-                ),
-                operand=None,
+        # Player defends TOP (mirror of the enemy).
+        def player_fallback_active() -> chex.Array:
+            # The pickup box hangs BELOW the sprite position for both teams, so the box
+            # offset is ADDED here too - it is not mirrored with the team's direction.
+            p_skater_high = (y_top + c.ATTACKING_ZONE_OFFSET_Y) + box_off  # skater's highest box
+            p_goalie_low = (y_bot - c.GOALIE_FORWARD_OFFSET) + box_off  # goalie's lowest box
+            only_goalie = puck_y < p_skater_high
+            only_skater = puck_y > p_goalie_low
+            return jnp.where(
+                only_goalie, jnp.int32(1),
+                jnp.where(only_skater, jnp.int32(0),
+                          closest_character(player_state.skater, player_state.goalie)),
             )
 
         active_player = resolve_team_active(
@@ -1356,38 +1384,72 @@ class JaxIceHockey(JaxEnvironment):
         pos_a: chex.Array,
         pos_b: chex.Array,
         min_separation: chex.Array,
+        bounds_a: chex.Array,
+        bounds_b: chex.Array,
     ) -> Tuple[chex.Array, chex.Array]:
-        """Resolve a cross-team (opponent) overlap: the confirmed "both shift".
+        """Resolve a cross-team (opponent) overlap, WALL-AWARE.
 
-        If the two characters are closer than ``min_separation``, push BOTH apart along
-        their centre-to-centre direction, each by half the penetration, so they end up
-        exactly ``min_separation`` apart. The centre-to-centre normal is what makes the
-        displacement diagonal. No-op when already separated.
+        Base case: if the two are closer than ``min_separation``, push BOTH apart along
+        their centre-to-centre normal, each by half the penetration, so they end up
+        exactly ``min_separation`` apart (the diagonal displacement).
 
-        Pure geometry of the *post-move* positions only — it needs no pre-move state.
+        Wall redirect: a player pinned against a wall cannot take its share of the push
+        on the blocked axis - the authoritative clamp would just snap it back, so the
+        pair never separates and the pinned player blocks the corner. When a player's
+        push component points into a wall it is against, that component is dropped and
+        its share is redirected onto the FREE (perpendicular) axis instead, so the
+        pinned player slides ALONG the wall out of the way. If BOTH of a player's axes
+        are blocked (it is jammed in a corner and the push points diagonally into that
+        corner), it cannot move at all and the other player takes the whole push.
 
-        Efficiency: the overlap *test* is done on squared distance (no sqrt). The push
-        itself needs the true distance for the unit normal and the linear penetration,
-        so a root is unavoidable here — but we fold sqrt + divide into a single
-        reciprocal-sqrt: 1/dist == rsqrt(dist**2), giving
-        ``offset = 0.5 * delta * (min_separation / dist - 1)``.
-
-        NOTE: ``min_separation`` (derived from body sizes) is not yet finalised; passed
-        in. Whether a tackled/downed character is still pushable is also unverified.
+        Bounds are ``(x_min, x_max, y_min, y_max)`` for each player. Pure geometry of
+        the post-move positions. ``min_separation`` not yet finalised; passed in.
         """
         delta = pos_a - pos_b
         dist_sq = jnp.sum(delta**2)
         overlapping = dist_sq < min_separation**2
 
-        # True distance is only needed via its reciprocal: 1/dist == rsqrt(dist**2).
         coincident = dist_sq <= 0.0
         inv_dist = jnp.where(coincident, 0.0, jax.lax.rsqrt(dist_sq))
-        # offset = 0.5 * (min_sep - dist) * (delta / dist) = 0.5 * delta * (min_sep/dist - 1)
-        offset = 0.5 * delta * (min_separation * inv_dist - 1.0)
-        # Coincident centres give no direction: default to separating along +x / -x.
-        offset = jnp.where(coincident, jnp.array([min_separation * 0.5, 0.0]), offset)
-        offset = jnp.where(overlapping, offset, jnp.array([0.0, 0.0]))
-        return pos_a + offset, pos_b - offset
+        # Each player's provisional half-share of the separation.
+        push = 0.5 * delta * (min_separation * inv_dist - 1.0)
+        push = jnp.where(coincident, jnp.array([min_separation * 0.5, 0.0]), push)
+
+        def redirect(shift, pos, bounds):
+            # shift: this player's provisional (dx, dy). Positive dx pushes +x, etc.
+            # A component is blocked if it pushes past the wall the player sits on.
+            at_xmin = pos[0] <= bounds[0]
+            at_xmax = pos[0] >= bounds[1]
+            at_ymin = pos[1] <= bounds[2]
+            at_ymax = pos[1] >= bounds[3]
+            blocked_x = (at_xmin & (shift[0] < 0)) | (at_xmax & (shift[0] > 0))
+            blocked_y = (at_ymin & (shift[1] < 0)) | (at_ymax & (shift[1] > 0))
+            dx, dy = shift[0], shift[1]
+            # Redirect a blocked axis's magnitude onto the free axis (preserving the
+            # free axis's sign; if the free axis has no sign yet, use the wall's inward
+            # direction). Only redirect when exactly one axis is blocked.
+            mag_x = jnp.abs(dx)
+            mag_y = jnp.abs(dy)
+            # x blocked, y free -> move on y by (mag_y + mag_x) in y's direction
+            y_dir = jnp.where(dy != 0, jnp.sign(dy), jnp.where(at_ymin, 1.0, -1.0))
+            x_dir = jnp.where(dx != 0, jnp.sign(dx), jnp.where(at_xmin, 1.0, -1.0))
+            only_x_blocked = blocked_x & jnp.logical_not(blocked_y)
+            only_y_blocked = blocked_y & jnp.logical_not(blocked_x)
+            both_blocked = blocked_x & blocked_y
+            new_dx = jnp.where(only_y_blocked, x_dir * (mag_x + mag_y),
+                      jnp.where(only_x_blocked, 0.0,
+                       jnp.where(both_blocked, 0.0, dx)))
+            new_dy = jnp.where(only_x_blocked, y_dir * (mag_x + mag_y),
+                      jnp.where(only_y_blocked, 0.0,
+                       jnp.where(both_blocked, 0.0, dy)))
+            return jnp.array([new_dx, new_dy])
+
+        shift_a = redirect(push, pos_a, bounds_a)
+        shift_b = redirect(-push, pos_b, bounds_b)
+        zero = jnp.array([0.0, 0.0])
+        shift_a = jnp.where(overlapping, shift_a, zero)
+        shift_b = jnp.where(overlapping, shift_b, zero)
+        return pos_a + shift_a, pos_b + shift_b
 
     def _enforce_min_vertical(
         self,
@@ -1457,10 +1519,10 @@ class JaxIceHockey(JaxEnvironment):
         e1, e2 = enemy_skater.position, enemy_goalie.position
 
         # 1) Opponent collisions — both shift along centre-to-centre.
-        p1, e1 = self._separate_opponents(p1, e1, min_separation)
-        p1, e2 = self._separate_opponents(p1, e2, min_separation)
-        p2, e1 = self._separate_opponents(p2, e1, min_separation)
-        p2, e2 = self._separate_opponents(p2, e2, min_separation)
+        p1, e1 = self._separate_opponents(p1, e1, min_separation, bounds_p1, bounds_e1)
+        p1, e2 = self._separate_opponents(p1, e2, min_separation, bounds_p1, bounds_e2)
+        p2, e1 = self._separate_opponents(p2, e1, min_separation, bounds_p2, bounds_e1)
+        p2, e2 = self._separate_opponents(p2, e2, min_separation, bounds_p2, bounds_e2)
 
         # 2) Same-team vertical push — the active skater holds, the teammate yields.
         p2 = jnp.where(
@@ -1853,21 +1915,22 @@ class JaxIceHockey(JaxEnvironment):
         x_max = c.RINK_RIGHT - c.PLAYER_W
         y_top = c.RINK_TOP - c.PLAYER_H + 9
         y_bot = c.RINK_BOTTOM - c.PLAYER_H
-        off = c.ATTACKING_ZONE_OFFSET_Y  # depth of the restricted zone
+        off = c.ATTACKING_ZONE_OFFSET_Y  # skater: depth of its own defensive zone
+        goff = c.GOALIE_FORWARD_OFFSET    # goalie: how far up it may leave its goal
         # Player defends the TOP goal, enemy the BOTTOM. A skater is kept out of its
-        # own defensive zone (so it plays toward the goal it attacks); a goalie stays
-        # in its defensive half but may enter its own goal crease.
+        # own defensive zone (so it plays toward the goal it attacks). A goalie may
+        # leave its goal only up to GOALIE_FORWARD_OFFSET (~2/3 of the ice).
         bounds_player_skater = jnp.array(
             [x_min, x_max, y_top + off, y_bot], dtype=jnp.float32
         )
         bounds_player_goalie = jnp.array(
-            [x_min, x_max, y_top, y_bot - off], dtype=jnp.float32
+            [x_min, x_max, y_top, y_bot - goff], dtype=jnp.float32
         )
         bounds_enemy_skater = jnp.array(
             [x_min, x_max, y_top, y_bot - off], dtype=jnp.float32
         )
         bounds_enemy_goalie = jnp.array(
-            [x_min, x_max, y_top + off, y_bot], dtype=jnp.float32
+            [x_min, x_max, y_top + goff, y_bot], dtype=jnp.float32
         )
 
         # 1) Active-skater resolution (per team, against the shared puck).
@@ -2060,8 +2123,16 @@ class IceHockeyRenderer(JAXGameRenderer):
         ) = self.jr.load_and_setup_assets(final_asset_config, self.sprite_path)
 
     @partial(jax.jit, static_argnums=(0,))
+    def _render_hook_post_background(
+        self, raster: jnp.ndarray, state: IceHockeyState
+    ) -> jnp.ndarray:
+        """No-op hook for mods to redraw the ice/boards before objects are stamped."""
+        return raster
+
+    @partial(jax.jit, static_argnums=(0,))
     def render(self, state: IceHockeyState) -> jnp.ndarray:
         raster = self.jr.create_object_raster(self.BACKGROUND)
+        raster = self._render_hook_post_background(raster, state)
 
         puck_m = self.SHAPE_MASKS["puck"]
 

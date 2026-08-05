@@ -1,22 +1,3 @@
-"""Quick rendering test harness for jax_icehockey.
-
-Two modes:
-
-  # 1. Headless snapshot — fastest way to eyeball the render while iterating.
-  #    Resets the env, renders one frame, writes it to a PNG (upscaled).
-  python test.py
-  python test.py --out frame.png --scale 6
-  python test.py --debug
-
-  # 2. Interactive — open a pygame window and drive the game by hand.
-  #    Arrow keys move player, Space = player FIRE, R = reset, Esc/Q = quit.
-  #    With --keyboard-enemy: WASD moves enemy, Left Shift = enemy FIRE.
-  python test.py --play
-  python test.py --play --keyboard-enemy --debug
-
-Run with --cpu to force JAX onto the CPU (handy if a GPU is busy/absent).
-"""
-
 import argparse
 import os
 import sys
@@ -49,18 +30,26 @@ def to_uint8_image(raster) -> np.ndarray:
     return img
 
 
-def make_env(debug: bool) -> JaxIceHockey:
+def make_env(debug: bool, mods: list = None):
+    if mods:
+        import jaxatari
+
+        return jaxatari.core.make("icehockey", mods=mods)
     return JaxIceHockey(IceHockeyConstants(DEBUG_RENDER=debug))
 
 
-def snapshot(out_path: str, scale: int, debug: bool) -> None:
-    env = make_env(debug)
+def snapshot(out_path: str, scale: int, debug: bool, mods: list = None) -> None:
+    env = make_env(debug, mods)
     _obs, state = env.reset(jrandom.PRNGKey(0))
     raster = env.render(state)
     img = to_uint8_image(raster)
 
-    print(f"render output: shape={np.asarray(raster).shape} dtype={np.asarray(raster).dtype}")
-    print(f"value range: min={img.min()} max={img.max()} (all-black means nothing was drawn)")
+    print(
+        f"render output: shape={np.asarray(raster).shape} dtype={np.asarray(raster).dtype}"
+    )
+    print(
+        f"value range: min={img.min()} max={img.max()} (all-black means nothing was drawn)"
+    )
 
     if scale > 1:
         img = np.kron(img, np.ones((scale, scale, 1), dtype=np.uint8))
@@ -104,10 +93,10 @@ def get_action(pygame, keys, up_key, down_key, left_key, right_key, fire_key):
     return Action.NOOP
 
 
-def play(scale: int, keyboard_enemy: bool, debug: bool) -> None:
+def play(scale: int, keyboard_enemy: bool, debug: bool, mods: list = None) -> None:
     import pygame
 
-    env = make_env(debug)
+    env = make_env(debug, mods)
     reset_fn = jax.jit(env.reset)
     step_fn = jax.jit(env.step)
     render_fn = jax.jit(env.render)
@@ -172,9 +161,15 @@ def play(scale: int, keyboard_enemy: bool, debug: bool) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--play", action="store_true", help="open an interactive pygame window")
-    parser.add_argument("--out", default="icehockey_frame.png", help="snapshot output path")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--play", action="store_true", help="open an interactive pygame window"
+    )
+    parser.add_argument(
+        "--out", default="icehockey_frame.png", help="snapshot output path"
+    )
     parser.add_argument("--scale", type=int, default=UPSCALE, help="upscale factor")
     parser.add_argument("--cpu", action="store_true", help="force JAX onto CPU")
     parser.add_argument(
@@ -187,12 +182,18 @@ def main() -> None:
         action="store_true",
         help="control the enemy with WASD and left shift instead of the NPC controller",
     )
+    parser.add_argument(
+        "--mods",
+        nargs="*",
+        default=None,
+        help="mod keys to apply via jaxatari.core.make, e.g. --mods change_border_shape",
+    )
     args = parser.parse_args()
 
     if args.play:
-        play(args.scale, args.keyboard_enemy, args.debug)
+        play(args.scale, args.keyboard_enemy, args.debug, args.mods)
     else:
-        snapshot(args.out, args.scale, args.debug)
+        snapshot(args.out, args.scale, args.debug, args.mods)
 
 
 if __name__ == "__main__":

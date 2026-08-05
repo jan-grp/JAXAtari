@@ -97,6 +97,7 @@ MOD_MODULES = {
     "montezumarevenge": "jaxatari.games.mods.montezuma_revenge_mods.MontezumaRevengeEnvMod",
     "frostbite": "jaxatari.games.mods.frostbite_mods.FrostbiteEnvMod",
     "gravitar": "jaxatari.games.mods.gravitar_mods.GravitarEnvMod",
+    "icehockey": "jaxatari.games.mods.icehockey_mods.IceHockeyEnvMod",
     "phoenix": "jaxatari.games.mods.phoenix_mods.PhoenixEnvMod",
     "enduro": "jaxatari.games.mods.enduro_mods.EnduroEnvMod",
     "qbert": "jaxatari.games.mods.qbert_mods.QbertEnvMod",
