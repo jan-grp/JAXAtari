@@ -322,6 +322,9 @@ class CharacterState:
     tackle_timer: (
         chex.Array
     )  # frames left while tackled; is_tackled == (tackle_timer > 0)
+    times_tackled: (
+        chex.Array
+    )  # knockdowns suffered this match; unused by the base game, read by mods
 
 
 @struct.dataclass
@@ -451,6 +454,7 @@ class JaxIceHockey(JaxEnvironment):
                 shooting_cooldown=jnp.array(0, dtype=jnp.int32),
                 walk_counter=jnp.array(0, dtype=jnp.int32),
                 tackle_timer=jnp.array(0, dtype=jnp.int32),
+                times_tackled=jnp.array(0, dtype=jnp.int32),
             )
 
         player_state = PlayerState(
@@ -892,7 +896,25 @@ class JaxIceHockey(JaxEnvironment):
         )
 
         # After the goal pause everyone snaps back to the face-off spots.
+        # times_tackled is a per-match statistic, so the fresh face-off
+        # characters inherit it instead of restarting at 0.
         fo_player, fo_enemy, fo_puck = self._faceoff_positions()
+        fo_player = fo_player.replace(
+            skater=fo_player.skater.replace(
+                times_tackled=player_state.skater.times_tackled
+            ),
+            goalie=fo_player.goalie.replace(
+                times_tackled=player_state.goalie.times_tackled
+            ),
+        )
+        fo_enemy = fo_enemy.replace(
+            skater=fo_enemy.skater.replace(
+                times_tackled=enemy_state.skater.times_tackled
+            ),
+            goalie=fo_enemy.goalie.replace(
+                times_tackled=enemy_state.goalie.times_tackled
+            ),
+        )
         player_state, enemy_state, puck_state = jax.lax.cond(
             goal_phase_over,
             lambda: (fo_player, fo_enemy, fo_puck),
@@ -1018,6 +1040,7 @@ class JaxIceHockey(JaxEnvironment):
                     tackle_timer=dur,
                     is_tackled=jnp.array(True),
                     has_puck=jnp.array(False),
+                    times_tackled=char.times_tackled + 1,
                 )
 
             new_def_sk = jax.lax.cond(
