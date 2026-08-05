@@ -8,6 +8,7 @@ from jaxatari.games.mods.icehockey.icehockey_mod_plugins import (
     NoAttackingZonesMod,
     DecreasedGoalSizeMod,
     DisableTacklingMod,
+    TackleSlowdownMod,
 )
 
 
@@ -25,6 +26,7 @@ class IceHockeyEnvMod(JaxAtariModController):
         "no_attacking_zones": NoAttackingZonesMod,
         "decreased_goal_size": DecreasedGoalSizeMod,
         "disable_tackling": DisableTacklingMod,
+        "tackle_slowdown": TackleSlowdownMod,
     }
 
     _mod_sprite_dir = os.path.join(os.path.dirname(__file__), "icehockey", "sprites")

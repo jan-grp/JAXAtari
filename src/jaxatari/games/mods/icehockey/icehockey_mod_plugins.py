@@ -1,15 +1,13 @@
+import os
 from functools import partial
 
 import jax
 import jax.numpy as jnp
-
-from jaxatari.modification import JaxAtariInternalModPlugin, JaxAtariPostStepModPlugin
-from jaxatari.environment import JAXAtariAction as Action
-import os
 import numpy as np
 import jaxatari.games
-from jaxatari.games.jax_icehockey import IceHockeyConstants
-from jaxatari.modification import JaxAtariInternalModPlugin
+from jaxatari.environment import JAXAtariAction as Action
+from jaxatari.games.jax_icehockey import CharacterState, IceHockeyConstants
+from jaxatari.modification import JaxAtariInternalModPlugin, JaxAtariPostStepModPlugin
 
 
 def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
@@ -94,6 +92,51 @@ class DecreasedGoalSizeMod(JaxAtariInternalModPlugin):
             "data": _make_narrowed_goal_background(_NEW_GOAL_X0, _NEW_GOAL_X1),
         }
     }
+
+
+class TackleSlowdownMod(JaxAtariInternalModPlugin):
+    """Characters get permanently slower each time they are tackled.
+
+    Every knockdown increments the victim's times_tackled counter in the base
+    game (a per-match statistic that survives the face-off resets after goals).
+    This mod patches _apply_team_inputs -- the single point through which all
+    four characters receive their per-frame input movement -- and scales each
+    character's speed by SLOWDOWN_PER_TACKLE ** times_tackled, floored at
+    MIN_SPEED_FACTOR so a much-tackled character never freezes entirely. Both
+    teams fatigue; tackling itself, shooting and collisions stay untouched.
+    """
+
+    SLOWDOWN_PER_TACKLE = 0.8  # speed multiplier applied per suffered knockdown
+    MIN_SPEED_FACTOR = 0.25  # lower bound on the accumulated slowdown
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _apply_team_inputs(
+        self,
+        char1: CharacterState,
+        char2: CharacterState,
+        active,
+        action,
+        bounds1,
+        bounds2,
+        velocity,
+    ):
+        # Same routing as the base implementation: the active character gets
+        # the real action, the teammate a NOOP.
+        action1 = jnp.where(active == 0, action, Action.NOOP)
+        action2 = jnp.where(active == 1, action, Action.NOOP)
+
+        def slowed(char: CharacterState):
+            factor = jnp.float32(self.SLOWDOWN_PER_TACKLE) ** char.times_tackled.astype(
+                jnp.float32
+            )
+            return velocity * jnp.maximum(factor, jnp.float32(self.MIN_SPEED_FACTOR))
+
+        # _apply_action is left unpatched, so this reuses the base movement
+        # primitive (freezing while tackled, orientation, walk cycle, swing).
+        return (
+            self._env._apply_action(char1, action1, bounds1, slowed(char1)),
+            self._env._apply_action(char2, action2, bounds2, slowed(char2)),
+        )
 
 
 def _goal_offset_x(consts, remaining_time, amplitude, speed=0.15):
