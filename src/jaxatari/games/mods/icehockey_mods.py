@@ -1,5 +1,10 @@
+import os
 from jaxatari.modification import JaxAtariModController
 from jaxatari.games.mods.icehockey.icehockey_mod_plugins import (
+    ChangeBorderShapeMod,
+    EnemySpeedUpMod,
+    MovingGoalsMod,
+    PlayerSlidingMod,
     NoAttackingZonesMod,
     DecreasedGoalSizeMod,
     DisableTacklingMod,
@@ -8,25 +13,27 @@ from jaxatari.games.mods.icehockey.icehockey_mod_plugins import (
 
 class IceHockeyEnvMod(JaxAtariModController):
     """
-    Game-specific Mod Controller for Ice Hockey.
-    It simply inherits all logic from JaxAtariModController and defines the REGISTRY.
+    Game-specific Mod Controller for IceHockey.
+    It simply inherits all logic from JaxAtariModController and defines the ICEHOCKEY_MOD_REGISTRY.
     """
 
     REGISTRY = {
+        "change_border_shape": ChangeBorderShapeMod,
+        "moving_goals": MovingGoalsMod,
+        "player_sliding": PlayerSlidingMod,
+        "enemy_speedup_on_goal": EnemySpeedUpMod,
         "no_attacking_zones": NoAttackingZonesMod,
         "decreased_goal_size": DecreasedGoalSizeMod,
         "disable_tackling": DisableTacklingMod,
     }
 
-    def __init__(self,
-                 env,
-                 mods_config: list = [],
-                 allow_conflicts: bool = False
-                 ):
+    _mod_sprite_dir = os.path.join(os.path.dirname(__file__), "icehockey", "sprites")
+
+    def __init__(self, env, mods_config: list = [], allow_conflicts: bool = False):
 
         super().__init__(
             env=env,
             mods_config=mods_config,
             allow_conflicts=allow_conflicts,
-            registry=self.REGISTRY
+            registry=self.REGISTRY,
         )
