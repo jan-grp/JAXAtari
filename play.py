@@ -93,7 +93,7 @@ def get_action(pygame, keys, up_key, down_key, left_key, right_key, fire_key):
     return Action.NOOP
 
 
-def play(scale: int, keyboard_enemy: bool, debug: bool, mods: list = None) -> None:
+def play(scale: int, keyboard_enemy: bool, debug: bool, mods: list = None, FPS: int = 60) -> None:
     import pygame
 
     env = make_env(debug, mods)
@@ -155,7 +155,7 @@ def play(scale: int, keyboard_enemy: bool, debug: bool, mods: list = None) -> No
         surf = pygame.transform.scale(surf, (w * scale, h * scale))
         screen.blit(surf, (0, 0))
         pygame.display.flip()
-        clock.tick(30)
+        clock.tick(FPS)
 
     pygame.quit()
 
@@ -188,10 +188,16 @@ def main() -> None:
         default=None,
         help="mod keys to apply via jaxatari.core.make, e.g. --mods change_border_shape",
     )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=60,
+        help="frames per second for the game loop",
+    )
     args = parser.parse_args()
 
     if args.play:
-        play(args.scale, args.keyboard_enemy, args.debug, args.mods)
+        play(args.scale, args.keyboard_enemy, args.debug, args.mods, args.fps)
     else:
         snapshot(args.out, args.scale, args.debug, args.mods)
 
