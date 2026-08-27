@@ -288,16 +288,16 @@ class IceHockeyConstants(struct.PyTreeNode):
 
     ENEMY_STICK_DY: float = struct.field(pytree_node=False, default=8.0)
 
-    PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=2)
-    PUCK_MIN_SPEED: float = struct.field(pytree_node=False, default=1.4)
-    PUCK_FRICTION_COEFF: float = struct.field(pytree_node=False, default=0.9995)
+    PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=1.4)
+    PUCK_MIN_SPEED: float = struct.field(pytree_node=False, default=0.6)
+    PUCK_FRICTION_COEFF: float = struct.field(pytree_node=False, default=0.994)
     # Unit [x, y] direction used to release the puck when the face-off ends.
     # Keep this direction valid for a normal puck shot; it is scaled by
     # PUCK_MAX_SPEED when applied.
     FACE_OFF_PUCK_DIRECTION: Tuple[float, float] = struct.field(
-        pytree_node=False, default=(-0.707, 0.707)
+        pytree_node=False, default=(-0.692, 0.692)
     )
-    FACE_OFF_PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=2)
+    FACE_OFF_PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=1)
 
     # Pick up region around the end of the stick in which the puck can be picked up
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
