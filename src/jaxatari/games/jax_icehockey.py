@@ -169,7 +169,8 @@ class IceHockeyConstants(struct.PyTreeNode):
     GOAL_X1: int = struct.field(pytree_node=False, default=96)
     ENEMY_GOAL_Y: int = struct.field(pytree_node=False, default=186)  # Bottom goal line
     PLAYER_GOAL_Y: int = struct.field(pytree_node=False, default=42)  # top goal line
-    GOAL_HEIGHT: int = struct.field(pytree_node=False, default=4)
+    GOAL_HEIGHT_TOP: int = struct.field(pytree_node=False, default=4)
+    GOAL_HEIGHT_BOTTOM: int = struct.field(pytree_node=False, default=3)
 
     # Sprite sizes, used for observation bounding boxes
     PLAYER_W: int = struct.field(pytree_node=False, default=26)
@@ -182,6 +183,10 @@ class IceHockeyConstants(struct.PyTreeNode):
     CHARACTER_CENTER_DY: int = struct.field(pytree_node=False, default=13)
 
     PLAYER_SPEED: float = struct.field(pytree_node=False, default=1.5)
+    # The ROM updates character positions every fourth raw frame and a free
+    # puck every second raw frame.  The game clock still advances every frame.
+    CHARACTER_UPDATE_CADENCE: int = struct.field(pytree_node=False, default=4)
+    FREE_PUCK_UPDATE_CADENCE: int = struct.field(pytree_node=False, default=2)
 
     # Skater leg walk-cycle: number of frames in the loop and how many game
     # frames each phase is shown for. The cycle advances only while a skater has
@@ -262,14 +267,14 @@ class IceHockeyConstants(struct.PyTreeNode):
     # Face-off layout. [x, y] = [col, row].
     FACEOFF_X: float = struct.field(pytree_node=False, default=79.0)
     FACEOFF_Y: float = struct.field(pytree_node=False, default=114.0)
-    PLAYER_SKATER_X: float = struct.field(pytree_node=False, default=54.0)
-    PLAYER_SKATER_Y: float = struct.field(pytree_node=False, default=84.0)
-    PLAYER_GOALIE_X: float = struct.field(pytree_node=False, default=62.0)
-    PLAYER_GOALIE_Y: float = struct.field(pytree_node=False, default=36.0)
-    ENEMY_SKATER_X: float = struct.field(pytree_node=False, default=80.0)
-    ENEMY_SKATER_Y: float = struct.field(pytree_node=False, default=105.0)
-    ENEMY_GOALIE_X: float = struct.field(pytree_node=False, default=64.0)
-    ENEMY_GOALIE_Y: float = struct.field(pytree_node=False, default=155.0)
+    PLAYER_SKATER_X: float = struct.field(pytree_node=False, default=52.0)
+    PLAYER_SKATER_Y: float = struct.field(pytree_node=False, default=81.0)
+    PLAYER_GOALIE_X: float = struct.field(pytree_node=False, default=61.0)
+    PLAYER_GOALIE_Y: float = struct.field(pytree_node=False, default=33.0)
+    ENEMY_SKATER_X: float = struct.field(pytree_node=False, default=83.0)
+    ENEMY_SKATER_Y: float = struct.field(pytree_node=False, default=103.0)
+    ENEMY_GOALIE_X: float = struct.field(pytree_node=False, default=63.0)
+    ENEMY_GOALIE_Y: float = struct.field(pytree_node=False, default=152.0)
 
     #  Puck wandert über 32 Slots am Stock hin und her.
     STICK_SLOTS: int = struct.field(pytree_node=False, default=32)
@@ -471,7 +476,7 @@ class JaxIceHockey(JaxEnvironment):
 
         player_state = PlayerState(
             skater=char(c.PLAYER_SKATER_X, c.PLAYER_SKATER_Y, orientation=1),
-            goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y, orientation=0),
+            goalie=char(c.PLAYER_GOALIE_X, c.PLAYER_GOALIE_Y, orientation=1),
             active_character=jnp.array(0, dtype=jnp.int32),
         )
         enemy_state = EnemyState(
@@ -527,16 +532,27 @@ class JaxIceHockey(JaxEnvironment):
 
         # no movement and no clock during goal pause, face-off and after game end
         frozen = gs.is_finished | gs.goal_scored | gs.is_faceoff
+        character_update = (
+            state.counter % self.consts.CHARACTER_UPDATE_CADENCE == 0
+        )
+        free_puck_update = (
+            state.counter % self.consts.FREE_PUCK_UPDATE_CADENCE == 0
+        )
 
         rng, tackle_key = jrandom.split(state.rng)
 
         def play_step(_):
-            new_player_state, new_enemy_state = self._characters_step(
-                state.player_state,
-                state.enemy_state,
-                state.puck_state.position,
-                player_action=player_action,
-                enemy_action=enemy_action,
+            new_player_state, new_enemy_state = jax.lax.cond(
+                character_update,
+                lambda _: self._characters_step(
+                    state.player_state,
+                    state.enemy_state,
+                    state.puck_state.position,
+                    player_action=player_action,
+                    enemy_action=enemy_action,
+                ),
+                lambda _: (state.player_state, state.enemy_state),
+                operand=None,
             )
 
             new_player_state, new_enemy_state, new_puck_state = self._puck_pickup(
@@ -553,7 +569,11 @@ class JaxIceHockey(JaxEnvironment):
             )
 
             new_puck_state = self._puck_carry(
-                new_player_state, new_enemy_state, new_puck_state, state.counter
+                new_player_state,
+                new_enemy_state,
+                new_puck_state,
+                state.counter,
+                advance_free_puck=free_puck_update,
             )
             new_player_state, new_enemy_state, new_puck_state = self._puck_shoot(
                 new_player_state, new_enemy_state, new_puck_state
@@ -1568,7 +1588,7 @@ class JaxIceHockey(JaxEnvironment):
         """Advance a puck and resolve the rink boards and rigid goal posts.
 
         The goal-post pixels use the same clamp-and-reflect rule as the outer
-        rink walls.  Their vertical span is the rink-facing ``GOAL_HEIGHT``
+        rink walls.  Their vertical span is the rink-facing goal-height
         pixels at the top and bottom board, while ``GOAL_X0`` and ``GOAL_X1``
         are the left and right post pixels respectively.
         """
@@ -1581,16 +1601,17 @@ class JaxIceHockey(JaxEnvironment):
         hit_bottom = tentative[1] > c.RINK_BOTTOM
         resolved_y = jnp.clip(tentative[1], c.RINK_TOP, c.RINK_BOTTOM)
 
-        # A GOAL_HEIGHT-pixel segment includes its board pixel, so its inward
-        # extent is GOAL_HEIGHT - 1.  A post only blocks a puck entering the
+        # A goal-height pixel segment includes its board pixel, so its inward
+        # extent is height - 1.  A post only blocks a puck entering the
         # goal mouth from its corresponding outside side; this mirrors the
         # outer-board convention, which permits occupying a wall pixel and
         # reflects only on the attempted step beyond it.
-        post_depth = c.GOAL_HEIGHT - 1
+        top_post_depth = c.GOAL_HEIGHT_TOP - 1
+        bottom_post_depth = c.GOAL_HEIGHT_BOTTOM - 1
         in_top_post_band = (resolved_y >= c.RINK_TOP) & (
-            resolved_y <= c.RINK_TOP + post_depth
+            resolved_y <= c.RINK_TOP + top_post_depth
         )
-        in_bottom_post_band = (resolved_y >= c.RINK_BOTTOM - post_depth) & (
+        in_bottom_post_band = (resolved_y >= c.RINK_BOTTOM - bottom_post_depth) & (
             resolved_y <= c.RINK_BOTTOM
         )
         in_post_band = in_top_post_band | in_bottom_post_band
@@ -1760,7 +1781,14 @@ class JaxIceHockey(JaxEnvironment):
             puck_state.replace(pickup_blocker=new_pickup_blocker),
         )
 
-    def _puck_carry(self, player_state, enemy_state, puck_state, counter):
+    def _puck_carry(
+        self,
+        player_state,
+        enemy_state,
+        puck_state,
+        counter,
+        advance_free_puck: chex.Array,
+    ):
         c = self.consts
         p_sk, p_go = player_state.skater, player_state.goalie
         e_sk, e_go = enemy_state.skater, enemy_state.goalie
@@ -1798,7 +1826,12 @@ class JaxIceHockey(JaxEnvironment):
             ),
         )
 
-        free_puck = self._puck_step(puck_state)
+        free_puck = jax.lax.cond(
+            advance_free_puck,
+            self._puck_step,
+            lambda puck: puck,
+            puck_state,
+        )
         new_puck_pos = jnp.where(anyone_has, carry_pos, free_puck.position)
         new_puck_vel = jnp.where(
             anyone_has, jnp.zeros(2, dtype=jnp.float32), free_puck.velocity
@@ -2404,8 +2437,8 @@ class IceHockeyRenderer(JAXGameRenderer):
             )
 
         # Blue (player) score on the left, gold (enemy) on the right, as in the ROM.
-        raster = draw_score(raster, state.game_state.player_score, 43, 33, dm_blue)
-        raster = draw_score(raster, state.game_state.enemy_score, 113, 103, dm_gold)
+        raster = draw_score(raster, state.game_state.player_score, 46, 33, dm_blue)
+        raster = draw_score(raster, state.game_state.enemy_score, 110, 103, dm_gold)
 
         # Clock "M:SS" at the top. remaining_time is in frames; round up so
         # 3:00 stays visible until the first tick.
