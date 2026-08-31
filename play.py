@@ -165,7 +165,7 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--play", action="store_true", help="open an interactive pygame window"
+        "--screenshot", action="store_true", help="open an interactive pygame window"
     )
     parser.add_argument(
         "--out", default="icehockey_frame.png", help="snapshot output path"
@@ -196,10 +196,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.play:
-        play(args.scale, args.keyboard_enemy, args.debug, args.mods, args.fps)
-    else:
+    if args.screenshot:
         snapshot(args.out, args.scale, args.debug, args.mods)
+    else:
+        play(args.scale, args.keyboard_enemy, args.debug, args.mods, args.fps)
 
 
 if __name__ == "__main__":
