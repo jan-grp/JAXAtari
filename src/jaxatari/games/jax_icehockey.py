@@ -1,7 +1,6 @@
 import os
 from functools import partial
-from typing import Tuple, Optional, Union
-from jax import lax
+from typing import Tuple, Optional
 import jax
 import jax.numpy as jnp
 import chex
@@ -177,10 +176,10 @@ class IceHockeyConstants(struct.PyTreeNode):
     PUCK_W: int = struct.field(pytree_node=False, default=2)
     PUCK_H: int = struct.field(pytree_node=False, default=2)
 
-    # Character movement per update tick. Horizontal coordinates advance by one
-    # pixel, while vertical coordinates advance by two.
-    PLAYER_SPEED: float = struct.field(pytree_node=False, default=1.0)
-    PLAYER_VERTICAL_SPEED: float = struct.field(pytree_node=False, default=2.0)
+    # Character positions advance on an integer gameplay grid: one pixel
+    # horizontally or two pixels vertically per character update.
+    CHARACTER_SPEED_X: float = struct.field(pytree_node=False, default=1.0)
+    CHARACTER_SPEED_Y: float = struct.field(pytree_node=False, default=2.0)
     # Characters and a free puck advance on separate fixed cadences.
     # The game clock still advances every frame.
     CHARACTER_UPDATE_CADENCE: int = struct.field(pytree_node=False, default=4)
@@ -191,19 +190,16 @@ class IceHockeyConstants(struct.PyTreeNode):
     # directional input.
     ANIM_CADENCE: int = struct.field(pytree_node=False, default=4)
 
-    # A stick swing remains active for six character-update ticks.
-    SHOOT_ANIM_FRAMES: int = struct.field(pytree_node=False, default=6)
+    # Swing state advances every character cadence: 0 = idle, 1..7 = active swing.
+    SWING_PHASE_COUNT: int = struct.field(pytree_node=False, default=8)
 
-    # Offset from the goal lines defining zone where goalie/skater can't move.
-    # A skater is kept out of its own defensive zone (this deep); a goalie is kept
-    # out of the opponent's far zone (this deep).
-    # Skater's own-goal margin, measured at the PICKUP BOX: the forward's stick is
-    # kept ~35% of the rink from its own goal (manual: "prevented from moving too
-    # close to his own goal"). Box-referenced so the active-zone test below lines up
-    # with where the stick can actually collect the puck.
-    ATTACKING_ZONE_OFFSET_Y: int = struct.field(pytree_node=False, default=47)
-    # Goalie's forward limit
-    GOALIE_FORWARD_OFFSET: int = struct.field(pytree_node=False, default=50)
+    # Exact vertical movement ranges in the game's integer character grid.
+    # Player goalie / enemy skater occupy the upper range; player skater / enemy
+    # goalie occupy the lower range.
+    UPPER_CHARACTER_GRID_Y_MIN: int = struct.field(pytree_node=False, default=55)
+    UPPER_CHARACTER_GRID_Y_MAX: int = struct.field(pytree_node=False, default=139)
+    LOWER_CHARACTER_GRID_Y_MIN: int = struct.field(pytree_node=False, default=9)
+    LOWER_CHARACTER_GRID_Y_MAX: int = struct.field(pytree_node=False, default=91)
     # Character contact box and fixed separation impulse.
     CONTACT_X_MIN: float = struct.field(pytree_node=False, default=-8.0)
     CONTACT_X_MAX: float = struct.field(pytree_node=False, default=7.0)
@@ -218,8 +214,7 @@ class IceHockeyConstants(struct.PyTreeNode):
 
     STICK_VISIBLE_CADENCE: int = struct.field(pytree_node=False, default=4)
 
-    # Body-check timing and goalie protection. Knockdown timers are counted in
-    # eighth-frame ticks;
+    # Knockdown timers advance at a slower cadence than the main game loop.
     TACKLE_TIMER_CADENCE: int = struct.field(pytree_node=False, default=8)
     PLAYER_GOALIE_PROTECTED_GRID_Y: int = struct.field(pytree_node=False, default=129)
     ENEMY_GOALIE_PROTECTED_GRID_Y: int = struct.field(pytree_node=False, default=19)
@@ -262,20 +257,11 @@ class IceHockeyConstants(struct.PyTreeNode):
     # # Slot 0 = an den Händen (Basis), Slot 31 = Schlägerspitze.
     STICK_MIN_DX: float = struct.field(pytree_node=False, default=5.0)  # Slot 0
     STICK_MAX_DX: float = struct.field(pytree_node=False, default=12.0)  # Slot 31
-    # feste Höhe — bewegt sich NICHT mit.
-    STICK_DY: float = struct.field(pytree_node=False, default=8.0)
-
-    ENEMY_STICK_DY: float = struct.field(pytree_node=False, default=8.0)
+    # Vertical offset of an attached puck from the character's top-left position.
+    PLAYER_CARRIED_PUCK_OFFSET_Y: float = struct.field(pytree_node=False, default=22.0)
+    ENEMY_CARRIED_PUCK_OFFSET_Y: float = struct.field(pytree_node=False, default=20.0)
 
     PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=2.0)
-    # Unit [x, y] direction used to release the puck when the face-off ends.
-    # Keep this direction valid for a normal puck shot; it is scaled by
-    # PUCK_MAX_SPEED when applied.
-    FACE_OFF_PUCK_DIRECTION: Tuple[float, float] = struct.field(
-        pytree_node=False, default=(-0.692, 0.692)
-    )
-    FACE_OFF_PUCK_MAX_SPEED: float = struct.field(pytree_node=False, default=1)
-
     # Pick up region around the end of the stick in which the puck can be picked up
     PICKUP_BOX_W: float = struct.field(pytree_node=False, default=16.0)
     PICKUP_BOX_H: float = struct.field(pytree_node=False, default=4.0)
@@ -309,11 +295,9 @@ class CharacterState:
     velocity: chex.Array  # float32 [vx, vy]; unused by the base game, available to mods
     orientation: chex.Array  # 0 = left, 1 = right
     has_puck: chex.Array
-    shooting_cooldown: chex.Array
+    swing_phase: chex.Array
     walk_counter: chex.Array  # leg walk-cycle phase counter (advances while moving)
-    tackle_timer: (
-        chex.Array
-    )  # eighth-frame ticks left while down; is_tackled == (tackle_timer > 0)
+    tackle_timer: chex.Array  # slow-cadence ticks left; is_tackled == (tackle_timer > 0)
     times_tackled: (
         chex.Array
     )  # knockdowns suffered this match; unused by the base game, read by mods
@@ -349,7 +333,7 @@ class EnemyState:
 class EnemyControllerState:
     """Persistent state for the computer-controlled team."""
 
-    target_grid: chex.Array  # int32 [x, y] in the controller coordinate grid
+    target_position: chex.Array  # float32 [x, y]
     move_dx: chex.Array  # int32 in {-1, 0, 1}
     move_dy: chex.Array  # int32 in {-1, 0, 1}
     fire: chex.Array  # bool
@@ -445,7 +429,21 @@ class JaxIceHockey(JaxEnvironment):
     def image_space(self) -> spaces.Box:
         return spaces.Box(low=0, high=255, shape=(210, 160, 3), dtype=jnp.uint8)
 
-    def _faceoff_positions(self) -> Tuple[PlayerState, EnemyState, PuckState]:
+    def _faceoff_launch_velocity(self, random_byte: chex.Array) -> chex.Array:
+        """Generate the deterministic face-off puck velocity."""
+        r = random_byte.astype(jnp.int32) & jnp.int32(255)
+
+        def component(byte):
+            fixed = byte - jnp.where(byte < 128, jnp.int32(256), jnp.int32(0))
+            return fixed.astype(jnp.float32) / 256.0
+
+        vx = component((r << 1) & jnp.int32(255))
+        vy = -component(r)
+        return jnp.array([vx, vy], dtype=jnp.float32)
+
+    def _faceoff_positions(
+        self, random_byte: chex.Array
+    ) -> Tuple[PlayerState, EnemyState, PuckState]:
         """Fresh character/puck states on the face-off spots (reset + after goals)."""
         c = self.consts
 
@@ -456,7 +454,7 @@ class JaxIceHockey(JaxEnvironment):
                 velocity=jnp.zeros(2, dtype=jnp.float32),
                 orientation=jnp.array(orientation, dtype=jnp.int32),
                 has_puck=jnp.array(False),
-                shooting_cooldown=jnp.array(0, dtype=jnp.int32),
+                swing_phase=jnp.array(0, dtype=jnp.int32),
                 walk_counter=jnp.array(0, dtype=jnp.int32),
                 tackle_timer=jnp.array(0, dtype=jnp.int32),
                 times_tackled=jnp.array(0, dtype=jnp.int32),
@@ -474,7 +472,7 @@ class JaxIceHockey(JaxEnvironment):
         )
         puck_state = PuckState(
             position=jnp.array([c.FACEOFF_X, c.FACEOFF_Y], dtype=jnp.float32),
-            velocity=jnp.array([0, 0], dtype=jnp.float32),
+            velocity=self._faceoff_launch_velocity(random_byte),
             position_stick=jnp.array(0, dtype=jnp.int32),
             pickup_blocker=jnp.array(-1, dtype=jnp.int32),
             pickup_blocker_timer=jnp.array(0, dtype=jnp.int32),
@@ -485,16 +483,18 @@ class JaxIceHockey(JaxEnvironment):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey = None) -> Tuple:
+        del key
         # Face-off: puck at centre, characters on start positions
         c = self.consts
-        player_state, enemy_state, puck_state = self._faceoff_positions()
+        initial_random_byte = jnp.array(0, dtype=jnp.int32)
+        player_state, enemy_state, puck_state = self._faceoff_positions(initial_random_byte)
 
         enemy_controller = EnemyControllerState(
-            target_grid=self._character_grid_position(enemy_state.skater.position),
+            target_position=enemy_state.skater.position,
             move_dx=jnp.array(0, dtype=jnp.int32),
             move_dy=jnp.array(0, dtype=jnp.int32),
             fire=jnp.array(False),
-            random_byte=jnp.array(0, dtype=jnp.int32),
+            random_byte=initial_random_byte,
         )
 
         state = IceHockeyState(
@@ -519,23 +519,17 @@ class JaxIceHockey(JaxEnvironment):
     def step(self, state: IceHockeyState, action):
         previous_state = state
         gs = state.game_state
-
-        # no movement and no clock during goal pause, face-off and after game end
         frozen = gs.is_finished | gs.goal_scored | gs.is_faceoff
 
-        # Keep the controller's deterministic random sequence advancing through pauses.
         advanced_controller = state.enemy_controller.replace(
             random_byte=self._next_random_byte(state.enemy_controller.random_byte)
         )
 
-        if isinstance(action, (tuple, list)):
-            player_action, enemy_action = action
-            new_enemy_controller = advanced_controller
-        else:
+        computer_controlled = not isinstance(action, (tuple, list))
+        if computer_controlled:
             player_action = action
             controller_state = state.replace(enemy_controller=advanced_controller)
             policy_action, policy_controller = self._enemy_policy(controller_state)
-            # Direction, fire, and target remain unchanged during pauses.
             new_enemy_controller = jax.lax.cond(
                 frozen,
                 lambda _: advanced_controller,
@@ -543,6 +537,10 @@ class JaxIceHockey(JaxEnvironment):
                 operand=None,
             )
             enemy_action = jnp.where(frozen, Action.NOOP, policy_action)
+        else:
+            player_action, enemy_action = action
+            new_enemy_controller = advanced_controller
+
         character_update = (
             state.counter % self.consts.CHARACTER_UPDATE_CADENCE == 0
         )
@@ -550,87 +548,103 @@ class JaxIceHockey(JaxEnvironment):
             state.counter % self.consts.FREE_PUCK_UPDATE_CADENCE == 0
         )
 
-        tackle_timer_tick = (
-            state.counter % self.consts.TACKLE_TIMER_CADENCE == 0
-        )
+        player_fire = self._action_has_fire(player_action)
+        enemy_fire = self._action_has_fire(enemy_action)
 
         def play_step(_):
-            player_state = self._tick_tackle_timers(
-                state.player_state, tackle_timer_tick
-            )
-            enemy_state = self._tick_tackle_timers(
-                state.enemy_state, tackle_timer_tick
+            player_state, enemy_state = jax.lax.cond(
+                character_update,
+                lambda _: self._move_characters(
+                    state.player_state,
+                    state.enemy_state,
+                    player_action,
+                    enemy_action,
+                ),
+                lambda _: (state.player_state, state.enemy_state),
+                operand=None,
             )
 
-            new_player_state, new_enemy_state, contacts, protections = jax.lax.cond(
+            player_state, enemy_state = self._tick_tackle_timers(
+                player_state, enemy_state, state.counter
+            )
+            player_state, enemy_state = self._update_swing_states(
+                player_state,
+                enemy_state,
+                player_action,
+                enemy_action,
+                state.counter,
+            )
+
+            player_state, enemy_state, puck_state, force_enemy_fire = jax.lax.cond(
                 character_update,
-                lambda _: self._characters_step(
+                lambda _: self._contact_step(
                     player_state,
                     enemy_state,
-                    state.puck_state.position,
-                    player_action=player_action,
-                    enemy_action=enemy_action,
+                    state.puck_state,
+                    random_byte=new_enemy_controller.random_byte,
+                    counter=state.counter,
+                    player_score=gs.player_score,
+                    enemy_score=gs.enemy_score,
                 ),
                 lambda _: (
                     player_state,
                     enemy_state,
-                    jnp.zeros(3, dtype=jnp.bool_),
-                    jnp.zeros(2, dtype=jnp.bool_),
+                    state.puck_state,
+                    jnp.array(False),
                 ),
                 operand=None,
             )
 
-            new_player_state, new_enemy_state, new_puck_state, contact_fire = (
-                self._tackle_step(
-                    new_player_state,
-                    new_enemy_state,
-                    state.puck_state,
-                    contacts,
-                    protections,
-                    new_enemy_controller.random_byte,
-                    state.counter,
-                    gs.player_score,
-                    gs.enemy_score,
-                )
+            controller = new_enemy_controller.replace(
+                fire=new_enemy_controller.fire
+                | (jnp.array(computer_controlled) & force_enemy_fire)
             )
 
-            new_player_state, new_enemy_state, new_puck_state = self._puck_pickup(
-                new_player_state,
-                new_enemy_state,
-                new_puck_state,
-                random_byte=new_enemy_controller.random_byte,
+            active_player, active_enemy = self._resolve_active_characters(
+                player_state, enemy_state, puck_state.position
+            )
+            player_state = player_state.replace(active_character=active_player)
+            enemy_state = enemy_state.replace(active_character=active_enemy)
+            player_state, enemy_state = self._finalize_character_positions(
+                player_state, enemy_state
             )
 
-            new_puck_state = self._puck_carry(
-                new_player_state,
-                new_enemy_state,
-                new_puck_state,
+            player_state, enemy_state, puck_state = self._puck_pickup(
+                player_state,
+                enemy_state,
+                puck_state,
+                random_byte=controller.random_byte,
+            )
+            puck_state = self._puck_carry(
+                player_state,
+                enemy_state,
+                puck_state,
                 advance_free_puck=free_puck_update,
             )
-            new_player_state, new_enemy_state, new_puck_state = self._puck_shoot(
-                new_player_state,
-                new_enemy_state,
-                new_puck_state,
+            player_state, enemy_state, puck_state = self._puck_shoot(
+                player_state,
+                enemy_state,
+                puck_state,
+                player_fire=player_fire,
+                enemy_fire=enemy_fire,
                 advance_free_puck=free_puck_update,
             )
-            return new_player_state, new_enemy_state, new_puck_state, contact_fire
+            return player_state, enemy_state, puck_state, controller
 
         def hold_step(_):
             return (
                 state.player_state,
                 state.enemy_state,
                 state.puck_state,
-                jnp.array(False),
+                new_enemy_controller,
             )
 
-        new_player_state, new_enemy_state, new_puck_state, contact_fire = jax.lax.cond(
-            frozen, hold_step, play_step, None
-        )
-
-        if not isinstance(action, (tuple, list)):
-            new_enemy_controller = new_enemy_controller.replace(
-                fire=new_enemy_controller.fire | contact_fire
-            )
+        (
+            new_player_state,
+            new_enemy_state,
+            new_puck_state,
+            new_enemy_controller,
+        ) = jax.lax.cond(frozen, hold_step, play_step, None)
 
         (
             new_player_state,
@@ -643,6 +657,7 @@ class JaxIceHockey(JaxEnvironment):
             new_enemy_state,
             new_puck_state,
             frozen,
+            random_byte=new_enemy_controller.random_byte,
         )
 
         state = state.replace(
@@ -695,7 +710,7 @@ class JaxIceHockey(JaxEnvironment):
     ) -> Tuple[chex.Array, EnemyControllerState]:
         """Stateful controller for the enemy's active character.
 
-        The controller follows a persistent integer-grid target and refreshes it only on
+        The controller follows a persistent target and only refreshes that target on
         selected frames. It chases a jittered point around the puck when defending,
         moves toward randomized goalward targets while carrying, and times shots from
         puck distance and stick phase. Direction and fire inputs persist between
@@ -734,7 +749,7 @@ class JaxIceHockey(JaxEnvironment):
             counter_high = (counter & jnp.int32(128)) != 0
 
             def refresh(_: None):
-                previous_target = current.target_grid
+                previous_target = current.target_position
 
                 def chase_puck(__: None):
                     extra_y = jnp.where(player_has_puck & ~counter_high, 8, 0)
@@ -751,10 +766,14 @@ class JaxIceHockey(JaxEnvironment):
                         + jnp.where(active.orientation == 1, -11, -4)
                         + y_clamped.astype(jnp.int32)
                     ) & jnp.int32(255)
-                    target_grid = jnp.array(
-                        [target_grid_x, target_grid_y], dtype=jnp.int32
+                    target = jnp.array(
+                        [
+                            target_grid_x - c.CHARACTER_GRID_X_OFFSET,
+                            c.CHARACTER_GRID_Y_ORIGIN - target_grid_y,
+                        ],
+                        dtype=jnp.float32,
                     )
-                    return target_grid, jnp.array(False)
+                    return target, jnp.array(False)
 
                 def carry_puck(__: None):
                     goalie_pass = active_is_goalie & counter_high
@@ -775,8 +794,12 @@ class JaxIceHockey(JaxEnvironment):
                         jnp.int32(c.PLAYER_GOAL_GRID_Y),
                         random_byte | jnp.int32(120),
                     )
-                    target_grid = jnp.array(
-                        [target_grid_x, target_grid_y], dtype=jnp.int32
+                    target = jnp.array(
+                        [
+                            target_grid_x - c.CHARACTER_GRID_X_OFFSET,
+                            c.CHARACTER_GRID_Y_ORIGIN - target_grid_y,
+                        ],
+                        dtype=jnp.float32,
                     )
 
                     near_goal = (
@@ -792,45 +815,35 @@ class JaxIceHockey(JaxEnvironment):
                     )
                     normal_shot = near_goal & angle_ok
 
-                    target_grid = jnp.where(
-                        goalie_pass, previous_target, target_grid
-                    )
+                    target = jnp.where(goalie_pass, previous_target, target)
                     fire = goalie_pass | normal_shot
-                    return target_grid, fire
+                    return target, fire
 
                 return jax.lax.cond(
                     enemy_has_puck, carry_puck, chase_puck, operand=None
                 )
 
-            target_grid, fire = jax.lax.cond(
+            target, fire = jax.lax.cond(
                 refresh_target,
                 refresh,
-                lambda _: (current.target_grid, current.fire),
+                lambda _: (current.target_position, current.fire),
                 operand=None,
             )
 
-            # Exact equality deliberately preserves the previous direction.
-            active_grid = self._character_grid_position(active.position)
+            px, py = active.position
+            tx, ty = target
             dx = jnp.where(
-                active_grid[0] < target_grid[0],
+                px < tx,
                 jnp.int32(1),
-                jnp.where(
-                    active_grid[0] > target_grid[0],
-                    jnp.int32(-1),
-                    current.move_dx,
-                ),
+                jnp.where(px > tx, jnp.int32(-1), current.move_dx),
             )
             dy = jnp.where(
-                active_grid[1] < target_grid[1],
+                py > ty,
                 jnp.int32(-1),
-                jnp.where(
-                    active_grid[1] > target_grid[1],
-                    jnp.int32(1),
-                    current.move_dy,
-                ),
+                jnp.where(py < ty, jnp.int32(1), current.move_dy),
             )
             return current.replace(
-                target_grid=target_grid,
+                target_position=target,
                 move_dx=dx,
                 move_dy=dy,
                 fire=fire,
@@ -870,6 +883,9 @@ class JaxIceHockey(JaxEnvironment):
         )
         return table[dy + 1, dx + 1, fire.astype(jnp.int32)]
 
+    def _action_has_fire(self, action: chex.Array) -> chex.Array:
+        return (action == Action.FIRE) | (action >= Action.UPFIRE)
+
     def _goal_and_reset_step(
         self,
         game_state: GameState,
@@ -877,6 +893,7 @@ class JaxIceHockey(JaxEnvironment):
         enemy_state: EnemyState,
         puck_state: PuckState,
         frozen: chex.Array,
+        random_byte: chex.Array,
     ) -> Tuple[PlayerState, EnemyState, PuckState, GameState]:
         """Detect goals, advance pause phases, and reset to face-off positions."""
         c = self.consts
@@ -932,7 +949,8 @@ class JaxIceHockey(JaxEnvironment):
         # After the goal pause everyone snaps back to the face-off spots.
         # times_tackled is a per-match statistic, so the fresh face-off
         # characters inherit it instead of restarting at 0.
-        fo_player, fo_enemy, fo_puck = self._faceoff_positions()
+        faceoff_random_byte = self._next_random_byte(random_byte)
+        fo_player, fo_enemy, fo_puck = self._faceoff_positions(faceoff_random_byte)
         fo_player = fo_player.replace(
             skater=fo_player.skater.replace(
                 times_tackled=player_state.skater.times_tackled
@@ -955,17 +973,6 @@ class JaxIceHockey(JaxEnvironment):
             lambda: (player_state, enemy_state, puck_state),
         )
 
-        # The face-off countdown holds the puck still. Release it when that countdown ends; 
-        # movement begins next frame.
-        faceoff_launch_velocity = jnp.asarray(
-            c.FACE_OFF_PUCK_DIRECTION, dtype=jnp.float32
-        ) * jnp.float32(c.FACE_OFF_PUCK_MAX_SPEED)
-        puck_state = puck_state.replace(
-            velocity=jnp.where(
-                faceoff_over, faceoff_launch_velocity, puck_state.velocity
-            )
-        )
-
         game_state = game_state.replace(
             pause_counter=pause_counter,
             player_score=game_state.player_score + player_scored.astype(jnp.int32),
@@ -977,119 +984,266 @@ class JaxIceHockey(JaxEnvironment):
         )
         return player_state, enemy_state, puck_state, game_state
 
-    def _tick_tackle_timers(self, team, tick: chex.Array):
-        """Advance downed-player timers on their fixed cadence."""
+    def _tick_tackle_timers(
+        self,
+        player_state: PlayerState,
+        enemy_state: EnemyState,
+        counter: chex.Array,
+    ) -> Tuple[PlayerState, EnemyState]:
+        tick = (counter % self.consts.TACKLE_TIMER_CADENCE) == 0
 
         def update(char: CharacterState) -> CharacterState:
-            timer = jnp.where(tick, jnp.maximum(char.tackle_timer - 1, 0), char.tackle_timer)
+            timer = jnp.where(
+                tick & (char.tackle_timer > 0),
+                char.tackle_timer - 1,
+                char.tackle_timer,
+            )
             return char.replace(tackle_timer=timer, is_tackled=timer > 0)
 
-        return team.replace(skater=update(team.skater), goalie=update(team.goalie))
+        return (
+            player_state.replace(
+                skater=update(player_state.skater),
+                goalie=update(player_state.goalie),
+            ),
+            enemy_state.replace(
+                skater=update(enemy_state.skater),
+                goalie=update(enemy_state.goalie),
+            ),
+        )
 
-    @staticmethod
-    def _signed_byte(value: chex.Array) -> chex.Array:
-        value = value.astype(jnp.int32) & jnp.int32(255)
-        return jnp.where(value < 128, value, value - 256)
+    def _update_swing_states(
+        self,
+        player_state: PlayerState,
+        enemy_state: EnemyState,
+        player_action: chex.Array,
+        enemy_action: chex.Array,
+        counter: chex.Array,
+    ) -> Tuple[PlayerState, EnemyState]:
+        def apply_fire(
+            skater: CharacterState,
+            goalie: CharacterState,
+            active: chex.Array,
+            fire: chex.Array,
+        ):
+            def update(char: CharacterState) -> CharacterState:
+                phase = jnp.where(
+                    fire & char.is_tackled,
+                    jnp.int32(0),
+                    jnp.where(
+                        fire & (char.swing_phase == 0),
+                        jnp.int32(1),
+                        char.swing_phase,
+                    ),
+                )
+                return char.replace(swing_phase=phase)
 
-    def _dropped_puck_velocity(
-        self, random_byte: chex.Array, second_player_was_hit: chex.Array
+            return (
+                jax.lax.cond(active == 0, update, lambda ch: ch, skater),
+                jax.lax.cond(active == 1, update, lambda ch: ch, goalie),
+            )
+
+        p_sk, p_go = apply_fire(
+            player_state.skater,
+            player_state.goalie,
+            player_state.active_character,
+            self._action_has_fire(player_action),
+        )
+        e_sk, e_go = apply_fire(
+            enemy_state.skater,
+            enemy_state.goalie,
+            enemy_state.active_character,
+            self._action_has_fire(enemy_action),
+        )
+
+        phase_tick = (counter % self.consts.CHARACTER_UPDATE_CADENCE) == 0
+
+        def advance(char: CharacterState) -> CharacterState:
+            phase = jnp.where(
+                phase_tick & (char.swing_phase > 0),
+                char.swing_phase + 1,
+                char.swing_phase,
+            )
+            phase = jnp.where(
+                phase >= self.consts.SWING_PHASE_COUNT, jnp.int32(0), phase
+            )
+            return char.replace(swing_phase=phase)
+
+        return (
+            player_state.replace(skater=advance(p_sk), goalie=advance(p_go)),
+            enemy_state.replace(skater=advance(e_sk), goalie=advance(e_go)),
+        )
+
+    def _characters_touch(
+        self, pos_a: chex.Array, pos_b: chex.Array
     ) -> chex.Array:
-        """Small deterministic impulse applied when a puck carrier is knocked down."""
+        c = self.consts
+        delta = pos_a - pos_b
+        return (
+            (delta[0] >= c.CONTACT_X_MIN)
+            & (delta[0] <= c.CONTACT_X_MAX)
+            & (delta[1] >= c.CONTACT_Y_MIN)
+            & (delta[1] <= c.CONTACT_Y_MAX)
+        )
+
+    def _knock_down(
+        self, char: CharacterState, random_byte: chex.Array
+    ) -> CharacterState:
+        timer = (random_byte.astype(jnp.int32) & jnp.int32(31)) | jnp.int32(8)
+        return char.replace(
+            tackle_timer=timer,
+            is_tackled=jnp.array(True),
+            has_puck=jnp.array(False),
+            times_tackled=char.times_tackled + 1,
+        )
+
+    def _tackle_drop_velocity(
+        self, random_byte: chex.Array, victim_is_second: chex.Array
+    ) -> chex.Array:
         r = random_byte.astype(jnp.int32) & jnp.int32(255)
-        vx = self._signed_byte((r << 1) & jnp.int32(255)).astype(jnp.float32) / 256.0
-        vy_first_hits_second = -self._signed_byte(r).astype(jnp.float32) / 256.0
-        vy_second_hits_first = (jnp.float32(256) - r.astype(jnp.float32)) / 256.0
-        vy = jnp.where(second_player_was_hit, vy_first_hits_second, vy_second_hits_first)
+
+        def signed_byte(value):
+            return jnp.where(value < 128, value, value - 256).astype(jnp.float32)
+
+        vx = signed_byte((r << 1) & jnp.int32(255)) / 256.0
+        vy = jnp.where(
+            victim_is_second,
+            -signed_byte(r) / 256.0,
+            1.0 - r.astype(jnp.float32) / 256.0,
+        )
         return jnp.array([vx, vy], dtype=jnp.float32)
 
-    def _tackle_step(
+    def _contact_pair(
+        self,
+        first: CharacterState,
+        second: CharacterState,
+        puck_state: PuckState,
+        random_byte: chex.Array,
+        protect_first: chex.Array = False,
+        protect_second: chex.Array = False,
+    ) -> Tuple[CharacterState, CharacterState, PuckState, chex.Array]:
+        protect_first = jnp.asarray(protect_first, dtype=jnp.bool_)
+        protect_second = jnp.asarray(protect_second, dtype=jnp.bool_)
+        touching = self._characters_touch(first.position, second.position)
+        random_phase = random_byte.astype(jnp.int32) & jnp.int32(7)
+        first_available = ~first.is_tackled
+
+        first_hits = (
+            touching
+            & first_available
+            & (first.swing_phase > 0)
+            & (random_phase == 4)
+            & ~protect_second
+        )
+        second_was_holder = second.has_puck
+        second = jax.lax.cond(
+            first_hits,
+            lambda ch: self._knock_down(ch, random_byte),
+            lambda ch: ch,
+            second,
+        )
+        drop_second = first_hits & second_was_holder
+        puck_state = puck_state.replace(
+            velocity=jnp.where(
+                drop_second,
+                self._tackle_drop_velocity(random_byte, jnp.array(True)),
+                puck_state.velocity,
+            ),
+            holder=jnp.where(drop_second, jnp.int32(-1), puck_state.holder),
+        )
+
+        second_hits = (
+            touching
+            & first_available
+            & (second.swing_phase > 0)
+            & (random_phase == 0)
+            & ~protect_first
+        )
+        first_was_holder = first.has_puck
+        first = jax.lax.cond(
+            second_hits,
+            lambda ch: self._knock_down(ch, random_byte),
+            lambda ch: ch,
+            first,
+        )
+        drop_first = second_hits & first_was_holder
+        puck_state = puck_state.replace(
+            velocity=jnp.where(
+                drop_first,
+                self._tackle_drop_velocity(random_byte, jnp.array(False)),
+                puck_state.velocity,
+            ),
+            holder=jnp.where(drop_first, jnp.int32(-1), puck_state.holder),
+        )
+
+        delta = first.position - second.position
+        shift_x = jnp.where(
+            delta[0] >= 0.0, self.consts.CONTACT_PUSH_X, -self.consts.CONTACT_PUSH_X
+        )
+        shift_y = jnp.where(
+            delta[1] <= 0.0, -self.consts.CONTACT_PUSH_Y, self.consts.CONTACT_PUSH_Y
+        )
+        shift = jnp.where(
+            touching,
+            jnp.array([shift_x, shift_y], dtype=jnp.float32),
+            jnp.zeros(2, dtype=jnp.float32),
+        )
+        first = first.replace(position=first.position + shift)
+        second = second.replace(position=second.position - shift)
+        return first, second, puck_state, touching
+
+    def _contact_step(
         self,
         player_state: PlayerState,
         enemy_state: EnemyState,
         puck_state: PuckState,
-        contacts: chex.Array,
-        protections: chex.Array,
         random_byte: chex.Array,
         counter: chex.Array,
         player_score: chex.Array,
         enemy_score: chex.Array,
     ) -> Tuple[PlayerState, EnemyState, PuckState, chex.Array]:
-        """Resolve body checks for the three possible opponent contacts."""
-        r = random_byte.astype(jnp.int32) & jnp.int32(255)
-        phase = r & jnp.int32(7)
-        duration = (r & jnp.int32(31)) | jnp.int32(8)
-
-        p_go = player_state.goalie
-        e_sk = enemy_state.skater
-        p_sk = player_state.skater
-        e_go = enemy_state.goalie
-        enemy_had_puck = e_sk.has_puck | e_go.has_puck
-
-        def knock_down(char: CharacterState, hit: chex.Array) -> CharacterState:
-            return char.replace(
-                tackle_timer=jnp.where(hit, duration, char.tackle_timer),
-                is_tackled=char.is_tackled | hit,
-                has_puck=char.has_puck & ~hit,
-                times_tackled=char.times_tackled + hit.astype(jnp.int32),
-            )
-
-        def resolve_pair(
-            first: CharacterState,
-            second: CharacterState,
-            touching: chex.Array,
-            first_protected: chex.Array = jnp.array(False),
-            second_protected: chex.Array = jnp.array(False),
-        ):
-            pair_active = touching & ~first.is_tackled
-            first_hits_second = (
-                pair_active
-                & (first.shooting_cooldown > 0)
-                & (phase == 4)
-                & ~second_protected
-            )
-            second_hits_first = (
-                pair_active
-                & (second.shooting_cooldown > 0)
-                & (phase == 0)
-                & ~first_protected
-            )
-
-            second_had_puck = second.has_puck
-            first_had_puck = first.has_puck
-            first = knock_down(first, second_hits_first)
-            second = knock_down(second, first_hits_second)
-
-            drop_second = first_hits_second & second_had_puck
-            drop_first = second_hits_first & first_had_puck
-            dropped = drop_second | drop_first
-            drop_velocity = self._dropped_puck_velocity(r, drop_second)
-            new_puck = puck_state.replace(
-                velocity=jnp.where(dropped, drop_velocity, puck_state.velocity),
-                holder=jnp.where(dropped, jnp.int32(-1), puck_state.holder),
-                carry_timer=jnp.where(dropped, jnp.int32(0), puck_state.carry_timer),
-            )
-            return first, second, new_puck, dropped
-
-        # Pair order follows physical contact resolution: skater/goalie, skater/skater,
-        # goalie/skater. Later pairs see any knockdown produced by an earlier pair.
-        p_sk, e_go, puck_state, _ = resolve_pair(
-            p_sk, e_go, contacts[2], second_protected=protections[1]
-        )
-        e_sk, p_sk, puck_state, _ = resolve_pair(e_sk, p_sk, contacts[1])
-        p_go, e_sk, puck_state, _ = resolve_pair(
-            p_go, e_sk, contacts[0], first_protected=protections[0]
+        p_sk, p_go = player_state.skater, player_state.goalie
+        e_sk, e_go = enemy_state.skater, enemy_state.goalie
+        aggressive = (player_score >= enemy_score) | (
+            (counter.astype(jnp.int32) & jnp.int32(255)) < 64
         )
 
-        player_state = player_state.replace(goalie=p_go, skater=p_sk)
-        enemy_state = enemy_state.replace(skater=e_sk, goalie=e_go)
-
-        aggression_window = (counter.astype(jnp.int32) & jnp.int32(255)) < 64
-        contact_fire = (
-            jnp.any(contacts)
-            & ~enemy_had_puck
-            & ((player_score >= enemy_score) | aggression_window)
+        enemy_holds = e_sk.has_puck | e_go.has_puck
+        contact_1 = self._characters_touch(p_sk.position, e_go.position)
+        force_fire_1 = contact_1 & ~enemy_holds & aggressive
+        enemy_goalie_grid_y = self._character_grid_position(e_go.position)[1]
+        p_sk, e_go, puck_state, _ = self._contact_pair(
+            p_sk,
+            e_go,
+            puck_state,
+            random_byte,
+            protect_second=enemy_goalie_grid_y < self.consts.ENEMY_GOALIE_PROTECTED_GRID_Y,
         )
-        return player_state, enemy_state, puck_state, contact_fire
+
+        enemy_holds = e_sk.has_puck | e_go.has_puck
+        contact_2 = self._characters_touch(e_sk.position, p_sk.position)
+        force_fire_2 = contact_2 & ~enemy_holds & aggressive
+        e_sk, p_sk, puck_state, _ = self._contact_pair(
+            e_sk, p_sk, puck_state, random_byte
+        )
+
+        enemy_holds = e_sk.has_puck | e_go.has_puck
+        contact_3 = self._characters_touch(p_go.position, e_sk.position)
+        force_fire_3 = contact_3 & ~enemy_holds & aggressive
+        player_goalie_grid_y = self._character_grid_position(p_go.position)[1]
+        p_go, e_sk, puck_state, _ = self._contact_pair(
+            p_go,
+            e_sk,
+            puck_state,
+            random_byte,
+            protect_first=player_goalie_grid_y >= self.consts.PLAYER_GOALIE_PROTECTED_GRID_Y,
+        )
+
+        return (
+            player_state.replace(skater=p_sk, goalie=p_go),
+            enemy_state.replace(skater=e_sk, goalie=e_go),
+            puck_state,
+            force_fire_1 | force_fire_2 | force_fire_3,
+        )
 
     def _resolve_active_characters(
         self,
@@ -1100,32 +1254,6 @@ class JaxIceHockey(JaxEnvironment):
         """Choose the controlled character for each team."""
         c = self.consts
         puck_grid = self._puck_grid_position(puck_position)
-
-        # While carried, control selection uses the puck's logical game coordinate,
-        # which stays vertically aligned with the holder rather than with the rendered
-        # puck sprite. Player-team holders use the holder y directly; enemy-team
-        # holders use the corresponding two-unit offset. This keeps a goalie controllable
-        # all the way to its legal forward limit without changing the rendered puck.
-        player_holds = player_state.skater.has_puck | player_state.goalie.has_puck
-        enemy_holds = enemy_state.skater.has_puck | enemy_state.goalie.has_puck
-        carried = player_holds | enemy_holds
-        holder_grid_y = jnp.where(
-            player_state.skater.has_puck,
-            self._character_grid_position(player_state.skater.position)[1],
-            jnp.where(
-                player_state.goalie.has_puck,
-                self._character_grid_position(player_state.goalie.position)[1],
-                jnp.where(
-                    enemy_state.skater.has_puck,
-                    self._character_grid_position(enemy_state.skater.position)[1],
-                    self._character_grid_position(enemy_state.goalie.position)[1],
-                ),
-            ),
-        )
-        carried_grid_y = (
-            holder_grid_y + jnp.where(enemy_holds, jnp.int32(2), jnp.int32(0))
-        ) & jnp.int32(255)
-        puck_grid = puck_grid.at[1].set(jnp.where(carried, carried_grid_y, puck_grid[1]))
         puck_y_even = puck_grid[1] & jnp.int32(254)
 
         def wrapped_abs_delta(a, b):
@@ -1181,9 +1309,6 @@ class JaxIceHockey(JaxEnvironment):
         self,
         character: CharacterState,
         action: chex.Array,
-        bounds: chex.Array,
-        horizontal_speed: chex.Array,
-        vertical_speed: chex.Array,
     ) -> CharacterState:
         """Apply one frame of joystick *input* movement to a single character.
 
@@ -1198,9 +1323,8 @@ class JaxIceHockey(JaxEnvironment):
         Args:
             character: The character to move.
             action: The chosen Atari action integer.
-            bounds: ``(x_min, x_max, y_min, y_max)`` provisional wall/zone clamp (see above).
-            horizontal_speed: Horizontal movement distance for this update.
-            vertical_speed: Vertical movement distance for this update.
+            Movement is intentionally left unclamped here. Position constraints are
+            applied only after opponent contacts, matching the gameplay update order.
 
         Returns:
             The updated ``CharacterState`` (position + orientation; other fields kept).
@@ -1258,19 +1382,16 @@ class JaxIceHockey(JaxEnvironment):
         movable = jnp.logical_not(character.is_tackled)
         dx = jnp.where(
             movable & right,
-            horizontal_speed,
-            jnp.where(movable & left, -horizontal_speed, 0.0),
+            self.consts.CHARACTER_SPEED_X,
+            jnp.where(movable & left, -self.consts.CHARACTER_SPEED_X, 0.0),
         )
-        # Screen y grows downward, so DOWN increases y and UP decreases it.
+        # Screen y grows downward. Vertical movement is two pixels per update.
         dy = jnp.where(
             movable & down,
-            vertical_speed,
-            jnp.where(movable & up, -vertical_speed, 0.0),
+            self.consts.CHARACTER_SPEED_Y,
+            jnp.where(movable & up, -self.consts.CHARACTER_SPEED_Y, 0.0),
         )
-
-        new_x = jnp.clip(character.position[0] + dx, bounds[0], bounds[1])
-        new_y = jnp.clip(character.position[1] + dy, bounds[2], bounds[3])
-        new_position = jnp.array([new_x, new_y])
+        new_position = character.position + jnp.array([dx, dy], dtype=jnp.float32)
 
         # Orientation: 0 = facing left, 1 = facing right.
         # input keeps the current facing; a tackled character keeps it too (frozen).
@@ -1283,38 +1404,10 @@ class JaxIceHockey(JaxEnvironment):
         has_input = movable & (up | down | left | right)
         new_walk_counter = jnp.where(has_input, character.walk_counter + 1, 0)
 
-        # Shooting/swing animation: a FIRE press starts the swing.
-        # shooting_cooldown counts the swing pose down to 0;
-        # a fresh press only (re)starts it when not already
-        # swinging, so holding FIRE replays the full swing.
-        # A tackled character cannot swing.
-        fire = movable & jnp.any(
-            jnp.array(
-                [
-                    action == Action.FIRE,
-                    action == Action.UPFIRE,
-                    action == Action.DOWNFIRE,
-                    action == Action.LEFTFIRE,
-                    action == Action.RIGHTFIRE,
-                    action == Action.UPRIGHTFIRE,
-                    action == Action.UPLEFTFIRE,
-                    action == Action.DOWNRIGHTFIRE,
-                    action == Action.DOWNLEFTFIRE,
-                ]
-            )
-        )
-        decremented = jnp.maximum(character.shooting_cooldown - 1, 0)
-        new_cooldown = jnp.where(
-            fire & (character.shooting_cooldown == 0),
-            self.consts.SHOOT_ANIM_FRAMES,
-            decremented,
-        )
-
         return character.replace(
             position=new_position,
             orientation=new_orientation,
             walk_counter=new_walk_counter,
-            shooting_cooldown=new_cooldown,
         )
 
     # ------------------------------------------------------------------ #
@@ -1326,10 +1419,6 @@ class JaxIceHockey(JaxEnvironment):
         char2: CharacterState,
         active: chex.Array,
         action: chex.Array,
-        bounds1: chex.Array,
-        bounds2: chex.Array,
-        horizontal_speed: chex.Array,
-        vertical_speed: chex.Array,
     ) -> Tuple[CharacterState, CharacterState]:
         """Apply one team's chosen action as phase-1 intended movement.
 
@@ -1342,48 +1431,18 @@ class JaxIceHockey(JaxEnvironment):
         This is shared by both teams: the player's action comes from the agent, the
         computer's from ``_enemy_policy``, but routing + application are identical.
 
-        Returns the two characters with their *provisional* (wall/zone-clamped) intended
-        positions; the authoritative position is decided later by ``_resolve_interactions``.
+        Returns the two characters with their unclamped provisional movement positions.
         """
         action1 = jnp.where(active == 0, action, Action.NOOP)
         action2 = jnp.where(active == 1, action, Action.NOOP)
         return (
-            self._apply_action(
-                char1, action1, bounds1, horizontal_speed, vertical_speed
-            ),
-            self._apply_action(
-                char2, action2, bounds2, horizontal_speed, vertical_speed
-            ),
+            self._apply_action(char1, action1),
+            self._apply_action(char2, action2),
         )
 
     # ------------------------------------------------------------------ #
-    # Phase 2 — interaction resolution (pure geometry, single fixed-order pass)
+    # Position constraints
     # ------------------------------------------------------------------ #
-    def _separate_opponents(
-        self,
-        pos_a: chex.Array,
-        pos_b: chex.Array,
-    ):
-        """Resolve close opponent contact and report whether the pair touched."""
-        c = self.consts
-        delta = pos_a - pos_b
-        touching = (
-            (delta[0] >= c.CONTACT_X_MIN)
-            & (delta[0] <= c.CONTACT_X_MAX)
-            & (delta[1] >= c.CONTACT_Y_MIN)
-            & (delta[1] <= c.CONTACT_Y_MAX)
-        )
-
-        # Ties deliberately choose a direction instead of preserving perfect alignment.
-        shift_x = jnp.where(delta[0] >= 0.0, c.CONTACT_PUSH_X, -c.CONTACT_PUSH_X)
-        shift_y = jnp.where(delta[1] <= 0.0, -c.CONTACT_PUSH_Y, c.CONTACT_PUSH_Y)
-        shift = jnp.where(
-            touching,
-            jnp.array([shift_x, shift_y], dtype=jnp.float32),
-            jnp.zeros(2, dtype=jnp.float32),
-        )
-        return pos_a + shift, pos_b - shift, touching
-
     def _enforce_min_vertical(
         self,
         active_pos: chex.Array,
@@ -1418,81 +1477,75 @@ class JaxIceHockey(JaxEnvironment):
             ]
         )
 
-    def _resolve_interactions(
-        self,
-        player_skater: CharacterState,
-        player_goalie: CharacterState,
-        enemy_skater: CharacterState,
-        enemy_goalie: CharacterState,
-        player_active: chex.Array,
-        enemy_active: chex.Array,
-        min_vertical_distance: chex.Array,
-        bounds_p1: chex.Array,
-        bounds_p2: chex.Array,
-        bounds_e1: chex.Array,
-        bounds_e2: chex.Array,
-    ):
-        """Resolve contacts, teammate spacing, and final movement bounds.
-
-        A single fixed-order pass resolves the three opponent pairs that can meet, then
-        applies the teammate spacing constraints and the final rink/zone clamps.
-        """
+    def _character_bounds(self):
         c = self.consts
-        p1, p2 = player_skater.position, player_goalie.position
-        e1, e2 = enemy_skater.position, enemy_goalie.position
+        x_min = c.RINK_LEFT
+        x_max = c.RINK_RIGHT - c.PLAYER_W
 
-        player_goalie_protected = (
-            self._character_grid_position(p2)[1] >= c.PLAYER_GOALIE_PROTECTED_GRID_Y
+        upper_y_min = c.CHARACTER_GRID_Y_ORIGIN - c.UPPER_CHARACTER_GRID_Y_MAX
+        upper_y_max = c.CHARACTER_GRID_Y_ORIGIN - c.UPPER_CHARACTER_GRID_Y_MIN
+        lower_y_min = c.CHARACTER_GRID_Y_ORIGIN - c.LOWER_CHARACTER_GRID_Y_MAX
+        lower_y_max = c.CHARACTER_GRID_Y_ORIGIN - c.LOWER_CHARACTER_GRID_Y_MIN
+
+        return (
+            # player skater
+            jnp.array([x_min, x_max, lower_y_min, lower_y_max], dtype=jnp.float32),
+            # player goalie
+            jnp.array([x_min, x_max, upper_y_min, upper_y_max], dtype=jnp.float32),
+            # enemy skater
+            jnp.array([x_min, x_max, upper_y_min, upper_y_max], dtype=jnp.float32),
+            # enemy goalie
+            jnp.array([x_min, x_max, lower_y_min, lower_y_max], dtype=jnp.float32),
         )
-        enemy_goalie_protected = (
-            self._character_grid_position(e2)[1] < c.ENEMY_GOALIE_PROTECTED_GRID_Y
-        )
 
-        # Opponent contacts. The fixed order matters when one skater touches two players.
-        p1, e2, contact_2 = self._separate_opponents(p1, e2)
-        e1, p1, contact_1 = self._separate_opponents(e1, p1)
-        p2, e1, contact_0 = self._separate_opponents(p2, e1)
+    def _finalize_character_positions(
+        self, player_state: PlayerState, enemy_state: EnemyState
+    ) -> Tuple[PlayerState, EnemyState]:
+        p1, p2 = player_state.skater.position, player_state.goalie.position
+        e1, e2 = enemy_state.skater.position, enemy_state.goalie.position
+        min_distance = jnp.float32(self.consts.MIN_VERTICAL_DISTANCE)
 
-        # 2) Same-team vertical push — the active skater holds, the teammate yields.
         p2 = jnp.where(
-            player_active == 0,
-            self._enforce_min_vertical(p1, p2, min_vertical_distance),
+            player_state.active_character == 0,
+            self._enforce_min_vertical(p1, p2, min_distance),
             p2,
         )
         p1 = jnp.where(
-            player_active == 1,
-            self._enforce_min_vertical(p2, p1, min_vertical_distance),
+            player_state.active_character == 1,
+            self._enforce_min_vertical(p2, p1, min_distance),
             p1,
         )
         e2 = jnp.where(
-            enemy_active == 0,
-            self._enforce_min_vertical(e1, e2, min_vertical_distance),
+            enemy_state.active_character == 0,
+            self._enforce_min_vertical(e1, e2, min_distance),
             e2,
         )
         e1 = jnp.where(
-            enemy_active == 1,
-            self._enforce_min_vertical(e2, e1, min_vertical_distance),
+            enemy_state.active_character == 1,
+            self._enforce_min_vertical(e2, e1, min_distance),
             e1,
         )
 
-        # 3) Authoritative clamp.
-        p1 = self._clamp_to_bounds(p1, bounds_p1)
-        p2 = self._clamp_to_bounds(p2, bounds_p2)
-        e1 = self._clamp_to_bounds(e1, bounds_e1)
-        e2 = self._clamp_to_bounds(e2, bounds_e2)
-
+        bp1, bp2, be1, be2 = self._character_bounds()
         return (
-            player_skater.replace(position=p1),
-            player_goalie.replace(position=p2),
-            enemy_skater.replace(position=e1),
-            enemy_goalie.replace(position=e2),
-            jnp.array([contact_0, contact_1, contact_2], dtype=jnp.bool_),
-            jnp.array([player_goalie_protected, enemy_goalie_protected], dtype=jnp.bool_),
+            player_state.replace(
+                skater=player_state.skater.replace(
+                    position=self._clamp_to_bounds(p1, bp1)
+                ),
+                goalie=player_state.goalie.replace(
+                    position=self._clamp_to_bounds(p2, bp2)
+                ),
+            ),
+            enemy_state.replace(
+                skater=enemy_state.skater.replace(
+                    position=self._clamp_to_bounds(e1, be1)
+                ),
+                goalie=enemy_state.goalie.replace(
+                    position=self._clamp_to_bounds(e2, be2)
+                ),
+            ),
         )
 
-    # ------------------------------------------------------------------ #
-    # Orchestrator — runs phase 1 then phase 2 for all four characters
-    # ------------------------------------------------------------------ #
     def _advance_puck_with_walls(
         self, position: chex.Array, velocity: chex.Array
     ) -> Tuple[chex.Array, chex.Array]:
@@ -1588,7 +1641,7 @@ class JaxIceHockey(JaxEnvironment):
         visible = jnp.where(phase < n, phase, 2 * n - 1 - phase)  # 0..7, 7..0
         return visible.astype(jnp.int32)
 
-    def _carried_puck_pos(self, char, visible, stick_dy):
+    def _carried_puck_pos(self, char, visible, offset_y):
         c = self.consts
         base = jnp.round(char.position)
         t = visible.astype(jnp.float32) / 7.0
@@ -1598,7 +1651,7 @@ class JaxIceHockey(JaxEnvironment):
             base[0] + c.PLAYER_W / 2.0 + dx,
             base[0] + c.PLAYER_W / 2.0 - dx - c.PUCK_W,
         )
-        y = base[1] + c.PLAYER_H / 2.0 + stick_dy
+        y = base[1] + offset_y
         return jnp.array([x, y], dtype=jnp.float32)
 
     def _puck_pickup(
@@ -1711,14 +1764,22 @@ class JaxIceHockey(JaxEnvironment):
 
         carry_pos = jnp.where(
             p_sk.has_puck,
-            self._carried_puck_pos(p_sk, visible, stick_dy=c.STICK_DY + 2.0),
+            self._carried_puck_pos(
+                p_sk, visible, offset_y=c.PLAYER_CARRIED_PUCK_OFFSET_Y
+            ),
             jnp.where(
                 p_go.has_puck,
-                self._carried_puck_pos(p_go, visible, stick_dy=c.STICK_DY + 2.0),
+                self._carried_puck_pos(
+                    p_go, visible, offset_y=c.PLAYER_CARRIED_PUCK_OFFSET_Y
+                ),
                 jnp.where(
                     e_sk.has_puck,
-                    self._carried_puck_pos(e_sk, visible, stick_dy=c.ENEMY_STICK_DY),
-                    self._carried_puck_pos(e_go, visible, stick_dy=c.ENEMY_STICK_DY),
+                    self._carried_puck_pos(
+                        e_sk, visible, offset_y=c.ENEMY_CARRIED_PUCK_OFFSET_Y
+                    ),
+                    self._carried_puck_pos(
+                        e_go, visible, offset_y=c.ENEMY_CARRIED_PUCK_OFFSET_Y
+                    ),
                 ),
             ),
         )
@@ -1746,15 +1807,17 @@ class JaxIceHockey(JaxEnvironment):
         player_state,
         enemy_state,
         puck_state,
+        player_fire: chex.Array,
+        enemy_fire: chex.Array,
         advance_free_puck: chex.Array,
     ):
         c = self.consts
         p_sk, p_go = player_state.skater, player_state.goalie
         e_sk, e_go = enemy_state.skater, enemy_state.goalie
-        sk_shoots = p_sk.has_puck & (p_sk.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
-        go_shoots = p_go.has_puck & (p_go.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
-        e_sk_shoots = e_sk.has_puck & (e_sk.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
-        e_go_shoots = e_go.has_puck & (e_go.shooting_cooldown == c.SHOOT_ANIM_FRAMES)
+        sk_shoots = p_sk.has_puck & player_fire
+        go_shoots = p_go.has_puck & player_fire
+        e_sk_shoots = e_sk.has_puck & enemy_fire
+        e_go_shoots = e_go.has_puck & enemy_fire
         should_shoot = sk_shoots | go_shoots | e_sk_shoots | e_go_shoots
 
         slot = puck_state.position_stick  # 0..31
@@ -1827,110 +1890,30 @@ class JaxIceHockey(JaxEnvironment):
             ),
         )
 
-    def _characters_step(
+    def _move_characters(
         self,
         player_state: PlayerState,
         enemy_state: EnemyState,
-        puck_position: chex.Array,
         player_action: chex.Array,
         enemy_action: chex.Array,
-    ):
-        """Advance all four characters and report the contacts seen this update.
-
-        This is the character-movement orchestrator shared by both teams. The movement
-        speed, collision tunables, and zone bounds are read from ``self.consts``;
-        ``enemy_action`` comes from ``_enemy_policy``. The lower-level geometry
-        primitives still take these as parameters so
-        they stay generic/unit-testable — only this orchestrator binds them to consts.
-
-        Steps:
-          1. Resolve each team's active (controlled) skater = closest to the puck.
-          2. Phase 1: apply each team's action as intended input movement (uniformly via
-             ``_apply_team_inputs`` — active skater gets the action, teammate gets NOOP).
-          3. Phase 2: resolve close opponent contacts, teammate spacing, and bounds.
-
-        Returns the updated ``PlayerState`` and ``EnemyState`` (positions/orientation
-        from movement, plus the resolved ``active_character`` for each team).
-        """
-        c = self.consts
-        horizontal_speed = jnp.float32(c.PLAYER_SPEED)
-        vertical_speed = jnp.float32(c.PLAYER_VERTICAL_SPEED)
-        min_vertical_distance = jnp.float32(c.MIN_VERTICAL_DISTANCE)
-        x_min = c.RINK_LEFT
-        x_max = c.RINK_RIGHT - c.PLAYER_W
-        y_top = c.RINK_TOP - c.PLAYER_H + 9
-        y_bot = c.RINK_BOTTOM - c.PLAYER_H
-        off = c.ATTACKING_ZONE_OFFSET_Y  # skater: depth of its own defensive zone
-        goff = c.GOALIE_FORWARD_OFFSET    # goalie: how far up it may leave its goal
-        # Player defends the TOP goal, enemy the BOTTOM. A skater is kept out of its
-        # own defensive zone (so it plays toward the goal it attacks). A goalie may
-        # leave its goal only up to GOALIE_FORWARD_OFFSET (~2/3 of the ice).
-        bounds_player_skater = jnp.array(
-            [x_min, x_max, y_top + off, y_bot], dtype=jnp.float32
-        )
-        bounds_player_goalie = jnp.array(
-            [x_min, x_max, y_top, y_bot - goff], dtype=jnp.float32
-        )
-        bounds_enemy_skater = jnp.array(
-            [x_min, x_max, y_top, y_bot - off], dtype=jnp.float32
-        )
-        bounds_enemy_goalie = jnp.array(
-            [x_min, x_max, y_top + goff, y_bot], dtype=jnp.float32
-        )
-
-        # 1) Active-skater resolution (per team, against the shared puck).
-        active_player, active_enemy = self._resolve_active_characters(
-            player_state, enemy_state, puck_position
-        )
-
-        # 2) Phase 1 — intended input movement, uniform over each team's two skaters.
+    ) -> Tuple[PlayerState, EnemyState]:
+        """Apply one scheduled movement update to each team's active character."""
         p1, p2 = self._apply_team_inputs(
             player_state.skater,
             player_state.goalie,
-            active_player,
+            player_state.active_character,
             player_action,
-            bounds_player_skater,
-            bounds_player_goalie,
-            horizontal_speed,
-            vertical_speed,
         )
         e1, e2 = self._apply_team_inputs(
             enemy_state.skater,
             enemy_state.goalie,
-            active_enemy,
+            enemy_state.active_character,
             enemy_action,
-            bounds_enemy_skater,
-            bounds_enemy_goalie,
-            horizontal_speed,
-            vertical_speed,
         )
-
-        # 3) Phase 2 — resolve interactions across all four post-move characters.
-        p1, p2, e1, e2, contacts, protections = self._resolve_interactions(
-            p1,
-            p2,
-            e1,
-            e2,
-            active_player,
-            active_enemy,
-            min_vertical_distance,
-            bounds_player_skater,
-            bounds_player_goalie,
-            bounds_enemy_skater,
-            bounds_enemy_goalie,
+        return (
+            player_state.replace(skater=p1, goalie=p2),
+            enemy_state.replace(skater=e1, goalie=e2),
         )
-
-        new_player_state = player_state.replace(
-            skater=p1,
-            goalie=p2,
-            active_character=active_player,
-        )
-        new_enemy_state = enemy_state.replace(
-            skater=e1,
-            goalie=e2,
-            active_character=active_enemy,
-        )
-        return new_player_state, new_enemy_state, contacts, protections
 
     def render(self, state: IceHockeyState) -> jnp.ndarray:
         return self.renderer.render(state)
@@ -2195,14 +2178,17 @@ class IceHockeyRenderer(JAXGameRenderer):
         def draw_player(r, char, is_active):
             frame = (char.walk_counter // cadence) % p_walk_l.shape[0]
             moving = char.walk_counter > 0
-            shooting = char.shooting_cooldown > 0
-            elapsed = self.consts.SHOOT_ANIM_FRAMES - char.shooting_cooldown
-            shoot_frame = (elapsed // cadence) % p_shoot_l.shape[0]
+            shooting = char.swing_phase > 0
+            shoot_frame = jnp.clip(
+                ((char.swing_phase - 1) * p_shoot_l.shape[0])
+                // (self.consts.SWING_PHASE_COUNT - 1),
+                0,
+                p_shoot_l.shape[0] - 1,
+            )
 
-            def draw_active(rr):
+            def draw_normal(rr):
                 return jax.lax.cond(
-                    shooting,
-                    lambda rrr: draw_player_shooting(rrr, char, shoot_frame),
+                    is_active,
                     lambda rrr: jax.lax.cond(
                         moving,
                         lambda rrrr: draw_oriented_frame(
@@ -2211,33 +2197,31 @@ class IceHockeyRenderer(JAXGameRenderer):
                         lambda rrrr: draw_oriented(rrrr, char, p_stand_l, p_stand_r),
                         rrr,
                     ),
+                    lambda rrr: draw_oriented(rrr, char, p_idle_l, p_idle_r),
                     rr,
                 )
 
             return jax.lax.cond(
-                is_active,
-                draw_active,
-                lambda rr: draw_oriented(rr, char, p_idle_l, p_idle_r),
+                shooting,
+                lambda rr: draw_player_shooting(rr, char, shoot_frame),
+                draw_normal,
                 r,
             )
 
         def draw_enemy(r, char, is_active):
             frame = (char.walk_counter // cadence) % e_walk_l.shape[0]
             moving = char.walk_counter > 0
-            shooting = char.shooting_cooldown > 0
-            elapsed = self.consts.SHOOT_ANIM_FRAMES - char.shooting_cooldown
-            shoot_frame = (elapsed // cadence) % e_shoot_l.shape[0]
+            shooting = char.swing_phase > 0
+            shoot_frame = jnp.clip(
+                ((char.swing_phase - 1) * e_shoot_l.shape[0])
+                // (self.consts.SWING_PHASE_COUNT - 1),
+                0,
+                e_shoot_l.shape[0] - 1,
+            )
 
-            def draw_active(rr):
+            def draw_normal(rr):
                 return jax.lax.cond(
-                    shooting,
-                    lambda rrr: draw_oriented_frame(
-                        rrr,
-                        char,
-                        e_shoot_l,
-                        e_shoot_r,
-                        shoot_frame,
-                    ),
+                    is_active,
                     lambda rrr: jax.lax.cond(
                         moving,
                         lambda rrrr: draw_oriented_frame(
@@ -2246,13 +2230,16 @@ class IceHockeyRenderer(JAXGameRenderer):
                         lambda rrrr: draw_oriented(rrrr, char, e_stand_l, e_stand_r),
                         rrr,
                     ),
+                    lambda rrr: draw_oriented(rrr, char, e_idle_l, e_idle_r),
                     rr,
                 )
 
             return jax.lax.cond(
-                is_active,
-                draw_active,
-                lambda rr: draw_oriented(rr, char, e_idle_l, e_idle_r),
+                shooting,
+                lambda rr: draw_oriented_frame(
+                    rr, char, e_shoot_l, e_shoot_r, shoot_frame
+                ),
+                draw_normal,
                 r,
             )
 
@@ -2377,8 +2364,12 @@ class IceHockeyRenderer(JAXGameRenderer):
             blue = jnp.array([0, 0, 255], dtype=frame.dtype)
             x0 = c.RINK_LEFT
             x1 = min(c.RINK_RIGHT + 1, c.WIDTH)
-            player_attack_line_y = c.PLAYER_GOAL_Y + c.ATTACKING_ZONE_OFFSET_Y
-            enemy_attack_line_y = c.ENEMY_GOAL_Y - c.ATTACKING_ZONE_OFFSET_Y
+            player_attack_line_y = (
+                c.CHARACTER_GRID_Y_ORIGIN - c.LOWER_CHARACTER_GRID_Y_MAX
+            )
+            enemy_attack_line_y = (
+                c.CHARACTER_GRID_Y_ORIGIN - c.UPPER_CHARACTER_GRID_Y_MIN
+            )
 
             frame = frame.at[player_attack_line_y, x0:x1, :].set(blue)
             frame = frame.at[enemy_attack_line_y, x0:x1, :].set(blue)
