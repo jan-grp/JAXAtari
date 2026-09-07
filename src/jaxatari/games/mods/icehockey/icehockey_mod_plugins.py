@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import jaxatari.games
 from jaxatari.environment import JAXAtariAction as Action
-from jaxatari.games.jax_icehockey import CharacterState, IceHockeyConstants
+from jaxatari.games.jax_icehockey import IceHockeyConstants
 from jaxatari.modification import JaxAtariInternalModPlugin, JaxAtariPostStepModPlugin
 
 
@@ -14,8 +14,8 @@ def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
     """Load the icehockey background and close the goal mouths down to [new_x0, new_x1).
 
     The rink is baked into the background sprite: each goal is a black gap in
-    the grey board band (rows PLAYER_GOAL_Y..+GOAL_HEIGHT at the top,
-    ENEMY_GOAL_Y-GOAL_HEIGHT+1..ENEMY_GOAL_Y at the bottom, columns
+    the grey board band (rows PLAYER_GOAL_Y..+GOAL_HEIGHT_TOP at the top,
+    ENEMY_GOAL_Y-GOAL_HEIGHT_BOTTOM+1..ENEMY_GOAL_Y at the bottom, columns
     GOAL_X0..GOAL_X1). The now-covered columns are filled with board pixels.
     """
     c = IceHockeyConstants()
@@ -27,8 +27,8 @@ def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
     )
     bg = np.load(sprite_path).copy()
     board = np.array([192, 192, 192, 255], dtype=np.uint8)
-    top_rows = slice(c.PLAYER_GOAL_Y, c.PLAYER_GOAL_Y + c.GOAL_HEIGHT)
-    bottom_rows = slice(c.ENEMY_GOAL_Y - c.GOAL_HEIGHT + 1, c.ENEMY_GOAL_Y + 1)
+    top_rows = slice(c.PLAYER_GOAL_Y, c.PLAYER_GOAL_Y + c.GOAL_HEIGHT_TOP)
+    bottom_rows = slice(c.ENEMY_GOAL_Y - c.GOAL_HEIGHT_BOTTOM + 1, c.ENEMY_GOAL_Y + 1)
     for rows in (top_rows, bottom_rows):
         bg[rows, c.GOAL_X0 : new_x0] = board
         bg[rows, new_x1 : c.GOAL_X1] = board
@@ -39,33 +39,43 @@ def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
 class NoAttackingZonesMod(JaxAtariInternalModPlugin):
     """Removes the attacking-zone restrictions from the rink.
 
-    In the base game ATTACKING_ZONE_OFFSET_Y carves a restricted band in front
-    of each goal: a skater is kept out of its own defensive zone and a goalie
-    out of the opponent's far zone (movement bounds in _characters_step), and
-    the same constant drives the zone-based active-character switching in
-    _resolve_active_characters. Overriding it to 0 collapses those zones, so
-    all four characters may skate the full rink and the active character falls
-    back to the closest-to-puck rule outside the goal areas.
+    In the base game each character is confined to a horizontal band in front of
+    one goal: _character_bounds derives an upper band and a lower band from
+    CHARACTER_GRID_Y_ORIGIN together with the UPPER/LOWER_CHARACTER_GRID_Y_MIN
+    and _MAX pairs, so a skater is kept out of its own defensive zone and a
+    goalie out of the opponent's far zone. Widening both bands to the full
+    skateable range collapses those zones and lets all four characters skate the
+    whole rink.
+
+    The band is y = ORIGIN - GRID_Y_MAX .. ORIGIN - GRID_Y_MIN, and the full
+    skateable range is RINK_TOP - PLAYER_H + 9 .. RINK_BOTTOM - PLAYER_H
+    (25..161 with the stock rink), so MAX = 166 - 25 = 141 and MIN = 166 - 161 = 5.
     """
 
     constants_overrides = {
-        "ATTACKING_ZONE_OFFSET_Y": 0,
+        "UPPER_CHARACTER_GRID_Y_MIN": 5,
+        "UPPER_CHARACTER_GRID_Y_MAX": 141,
+        "LOWER_CHARACTER_GRID_Y_MIN": 5,
+        "LOWER_CHARACTER_GRID_Y_MAX": 141,
     }
 
 
 class DisableTacklingMod(JaxAtariInternalModPlugin):
     """Disables body-checks: no character can ever be knocked down.
 
-    A tackle only lands in _tackle_step when a per-swing random roll is below
-    TACKLE_SUCCESS_PROB; with the probability forced to 0.0 the roll
-    (uniform in [0, 1)) can never succeed. The FIRE swing itself is untouched,
-    so shooting the puck and the swing animation still work as in the base
-    game -- opponents just never go down.
+    The base game has no tackle-probability constant to zero out - a check lands
+    on a hardcoded random-phase match inside _contact_pair, which then calls
+    _knock_down on the victim. Making _knock_down a no-op is the smallest change
+    that guarantees nobody is ever downed, while leaving the ordinary body
+    contact/push between characters intact.
+
+    Note: contact still strips the puck from a carrier, since that is decided in
+    _contact_pair rather than in _knock_down; only the knockdown itself is gone.
     """
 
-    constants_overrides = {
-        "TACKLE_SUCCESS_PROB": 0.0,
-    }
+    @partial(jax.jit, static_argnums=(0,))
+    def _knock_down(self, char, random_byte):
+        return char
 
 
 class DecreasedGoalSizeMod(JaxAtariInternalModPlugin):
@@ -97,46 +107,37 @@ class DecreasedGoalSizeMod(JaxAtariInternalModPlugin):
 class TackleSlowdownMod(JaxAtariInternalModPlugin):
     """Characters get permanently slower each time they are tackled.
 
-    Every knockdown increments the victim's times_tackled counter in the base
-    game (a per-match statistic that survives the face-off resets after goals).
-    This mod patches _apply_team_inputs -- the single point through which all
-    four characters receive their per-frame input movement -- and scales each
-    character's speed by SLOWDOWN_PER_TACKLE ** times_tackled, floored at
-    MIN_SPEED_FACTOR so a much-tackled character never freezes entirely. Both
-    teams fatigue; tackling itself, shooting and collisions stay untouched.
+    times_tackled is maintained by the base game (and carried across face-offs),
+    so it is a per-match knockdown count. Each knockdown multiplies that
+    character's movement by SLOWDOWN_PER_TACKLE, down to MIN_SPEED_FACTOR.
+
+    The base _apply_action no longer accepts an injected velocity - it moves the
+    character at the fixed CHARACTER_SPEED_X/Y - so rather than reimplementing
+    movement this lets the base primitive move the character normally and then
+    shrinks the displacement it produced. Freezing while tackled, orientation and
+    the walk cycle therefore stay exactly as the base game computes them.
     """
 
-    SLOWDOWN_PER_TACKLE = 0.8  # speed multiplier applied per suffered knockdown
-    MIN_SPEED_FACTOR = 0.25  # lower bound on the accumulated slowdown
+    SLOWDOWN_PER_TACKLE = 0.8
+    MIN_SPEED_FACTOR = 0.3
 
     @partial(jax.jit, static_argnums=(0,))
-    def _apply_team_inputs(
-        self,
-        char1: CharacterState,
-        char2: CharacterState,
-        active,
-        action,
-        bounds1,
-        bounds2,
-        velocity,
-    ):
-        # Same routing as the base implementation: the active character gets
-        # the real action, the teammate a NOOP.
+    def _apply_team_inputs(self, char1, char2, active, action):
+        # Same routing as the base implementation: the active character gets the
+        # real action, the teammate a NOOP.
         action1 = jnp.where(active == 0, action, Action.NOOP)
         action2 = jnp.where(active == 1, action, Action.NOOP)
 
-        def slowed(char: CharacterState):
-            factor = jnp.float32(self.SLOWDOWN_PER_TACKLE) ** char.times_tackled.astype(
+        def slowed(prev_char, act):
+            moved = self._env._apply_action(prev_char, act)
+            factor = jnp.float32(self.SLOWDOWN_PER_TACKLE) ** prev_char.times_tackled.astype(
                 jnp.float32
             )
-            return velocity * jnp.maximum(factor, jnp.float32(self.MIN_SPEED_FACTOR))
+            factor = jnp.maximum(factor, jnp.float32(self.MIN_SPEED_FACTOR))
+            delta = moved.position - prev_char.position
+            return moved.replace(position=prev_char.position + delta * factor)
 
-        # _apply_action is left unpatched, so this reuses the base movement
-        # primitive (freezing while tackled, orientation, walk cycle, swing).
-        return (
-            self._env._apply_action(char1, action1, bounds1, slowed(char1)),
-            self._env._apply_action(char2, action2, bounds2, slowed(char2)),
-        )
+        return slowed(char1, action1), slowed(char2, action2)
 
 
 def _goal_offset_x(consts, remaining_time, amplitude, speed=0.15):
@@ -216,12 +217,10 @@ class ChangeBorderShapeMod(JaxAtariInternalModPlugin):
             pos = jnp.where(penetrating, pos + penetration * n_in, pos)
             vel = jnp.where(hit, vel - 2.0 * jnp.dot(vel, n_in) * n_in, vel)
 
-        # Friction (unchanged from the base game).
-        current_speed = jnp.linalg.norm(vel)
-        fric_coeff = jnp.where(
-            current_speed > c.PUCK_MIN_SPEED, c.PUCK_FRICTION_COEFF, 1.0
-        )
-        vel = vel * fric_coeff
+        # Friction (unchanged from the base game). The base models this as a
+        # fixed-point 1/256 decay in _decay_puck_velocity rather than a
+        # coefficient, so delegate instead of reimplementing it.
+        vel = self._env._decay_puck_velocity(vel)
 
         return puck.replace(position=pos, velocity=vel)
 
@@ -243,7 +242,7 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
 
     @partial(jax.jit, static_argnums=(0,))
     def _goal_and_reset_step(
-        self, game_state, player_state, enemy_state, puck_state, frozen
+        self, game_state, player_state, enemy_state, puck_state, frozen, random_byte
     ):
         c = self._env.consts
 
@@ -305,16 +304,38 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
             ),
         )
 
-        fo_player, fo_enemy, fo_puck = self._env._faceoff_positions()
+        # After the goal pause everyone snaps back to the face-off spots. The
+        # base game draws a fresh random byte for the face-off and carries
+        # times_tackled across (it is a per-match statistic), so mirror both.
+        faceoff_random_byte = self._env._next_random_byte(random_byte)
+        fo_player, fo_enemy, fo_puck = self._env._faceoff_positions(faceoff_random_byte)
+        fo_player = fo_player.replace(
+            skater=fo_player.skater.replace(
+                times_tackled=player_state.skater.times_tackled
+            ),
+            goalie=fo_player.goalie.replace(
+                times_tackled=player_state.goalie.times_tackled
+            ),
+        )
+        fo_enemy = fo_enemy.replace(
+            skater=fo_enemy.skater.replace(
+                times_tackled=enemy_state.skater.times_tackled
+            ),
+            goalie=fo_enemy.goalie.replace(
+                times_tackled=enemy_state.goalie.times_tackled
+            ),
+        )
         player_state, enemy_state, puck_state = jax.lax.cond(
             goal_phase_over,
             lambda: (fo_player, fo_enemy, fo_puck),
             lambda: (player_state, enemy_state, puck_state),
         )
 
-        faceoff_launch_velocity = jnp.asarray(
-            c.FACE_OFF_PUCK_DIRECTION, dtype=jnp.float32
-        ) * jnp.float32(c.FACE_OFF_PUCK_MAX_SPEED)
+        # The face-off launch velocity now comes from _faceoff_positions itself,
+        # so re-derive it from the same random byte when the face-off ends.
+        faceoff_launch_velocity = self._env._faceoff_launch_velocity(
+            faceoff_random_byte
+        )
         puck_state = puck_state.replace(
             velocity=jnp.where(
                 faceoff_over, faceoff_launch_velocity, puck_state.velocity
@@ -350,9 +371,10 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         # with ice. Measured directly from background.npy: row RINK_TOP-1 and row
         # RINK_BOTTOM are each fully boards-colored across the *entire* rink
         # width (not ice at all), so the true ice band is [RINK_TOP,
-        # RINK_BOTTOM - 1] and both notches are exactly GOAL_HEIGHT rows,
-        # symmetric: [RINK_TOP, RINK_TOP+GOAL_HEIGHT) and
-        # [RINK_BOTTOM-GOAL_HEIGHT, RINK_BOTTOM). Painting ice into row
+        # RINK_BOTTOM - 1]. The two notches are NOT the same height: the top is
+        # GOAL_HEIGHT_TOP rows, [RINK_TOP, RINK_TOP+GOAL_HEIGHT_TOP), and the
+        # bottom GOAL_HEIGHT_BOTTOM rows,
+        # [RINK_BOTTOM-GOAL_HEIGHT_BOTTOM, RINK_BOTTOM). Painting ice into row
         # RINK_BOTTOM itself (as an earlier version of this code did, based on a
         # single-column measurement that couldn't tell "row is black because of
         # the notch" apart from "row is black everywhere regardless of the
@@ -361,14 +383,14 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         close_positions = jnp.array(
             [
                 [c.GOAL_X0 - 1.0, c.RINK_TOP],
-                [c.GOAL_X0 - 1.0, c.RINK_BOTTOM - c.GOAL_HEIGHT],
+                [c.GOAL_X0 - 1.0, c.RINK_BOTTOM - c.GOAL_HEIGHT_BOTTOM],
             ],
             dtype=jnp.float32,
         )
         close_sizes = jnp.array(
             [
-                [goal_width + 2.0, c.GOAL_HEIGHT],
-                [goal_width + 2.0, c.GOAL_HEIGHT],
+                [goal_width + 2.0, c.GOAL_HEIGHT_TOP],
+                [goal_width + 2.0, c.GOAL_HEIGHT_BOTTOM],
             ],
             dtype=jnp.float32,
         )
@@ -377,12 +399,19 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         # Cut new, smaller notches at each goal's own current dynamic position.
         xs = jnp.stack([top_x0, bottom_x0])
         ys = jnp.array(
-            [float(c.RINK_TOP), float(c.RINK_BOTTOM - c.GOAL_HEIGHT)], dtype=jnp.float32
+            [float(c.RINK_TOP), float(c.RINK_BOTTOM - c.GOAL_HEIGHT_BOTTOM)],
+            dtype=jnp.float32,
         )
         open_positions = jnp.stack([xs, ys], axis=1)
         open_sizes = jnp.full((2, 2), 0.0, dtype=jnp.float32)
         open_sizes = open_sizes.at[:, 0].set(float(self.GOAL_WIDTH))
-        open_sizes = open_sizes.at[:, 1].set(float(c.GOAL_HEIGHT))
+        # The two notches differ in height, so set them per row.
+        open_sizes = open_sizes.at[:, 1].set(
+            jnp.array(
+                [float(c.GOAL_HEIGHT_TOP), float(c.GOAL_HEIGHT_BOTTOM)],
+                dtype=jnp.float32,
+            )
+        )
         raster = jr.draw_rects(raster, open_positions, open_sizes, board_id)
 
         return raster
@@ -395,7 +424,7 @@ class PlayerSlidingMod(JaxAtariInternalModPlugin):
     MIN_SLIDE_SPEED = 0.15
 
     @partial(jax.jit, static_argnums=(0,))
-    def _apply_action(self, character, action, bounds, velocity):
+    def _apply_action(self, character, action):
         up = jnp.any(
             jnp.array(
                 [
@@ -453,8 +482,12 @@ class PlayerSlidingMod(JaxAtariInternalModPlugin):
         # velocity, so pressing the opposite direction targets -velocity even while
         # still sliding the old way — the blend below is what makes that a slide
         # instead of an instant reversal.
-        target_vx = jnp.where(right, velocity, jnp.where(left, -velocity, 0.0))
-        target_vy = jnp.where(down, velocity, jnp.where(up, -velocity, 0.0))
+        # The base primitive moves at fixed CHARACTER_SPEED_X/Y per update; use
+        # those as the steady-state glide speed the blend converges to.
+        speed_x = jnp.float32(self._env.consts.CHARACTER_SPEED_X)
+        speed_y = jnp.float32(self._env.consts.CHARACTER_SPEED_Y)
+        target_vx = jnp.where(right, speed_x, jnp.where(left, -speed_x, 0.0))
+        target_vy = jnp.where(down, speed_y, jnp.where(up, -speed_y, 0.0))
         target = jnp.array([target_vx, target_vy], dtype=jnp.float32)
 
         # Blend current velocity toward the target (exponential decay of the
@@ -469,9 +502,10 @@ class PlayerSlidingMod(JaxAtariInternalModPlugin):
             movable, settled_velocity, jnp.zeros(2, dtype=jnp.float32)
         )
 
-        new_x = jnp.clip(character.position[0] + new_velocity[0], bounds[0], bounds[1])
-        new_y = jnp.clip(character.position[1] + new_velocity[1], bounds[2], bounds[3])
-        new_position = jnp.array([new_x, new_y])
+        # No clamping here: like the base _apply_action this only produces the
+        # intended movement, and the base game clamps to the character's bounds
+        # afterwards in _finalize_character_positions.
+        new_position = character.position + new_velocity
 
         # Orientation: 0 = facing left, 1 = facing right. Input keeps the current
         # facing; a tackled character keeps it too (frozen).
@@ -484,35 +518,12 @@ class PlayerSlidingMod(JaxAtariInternalModPlugin):
         has_motion = movable & (jnp.linalg.norm(new_velocity) > self.MIN_SLIDE_SPEED)
         new_walk_counter = jnp.where(has_motion, character.walk_counter + 1, 0)
 
-        # Shooting/swing animation (unchanged from the base game).
-        fire = movable & jnp.any(
-            jnp.array(
-                [
-                    action == Action.FIRE,
-                    action == Action.UPFIRE,
-                    action == Action.DOWNFIRE,
-                    action == Action.LEFTFIRE,
-                    action == Action.RIGHTFIRE,
-                    action == Action.UPRIGHTFIRE,
-                    action == Action.UPLEFTFIRE,
-                    action == Action.DOWNRIGHTFIRE,
-                    action == Action.DOWNLEFTFIRE,
-                ]
-            )
-        )
-        decremented = jnp.maximum(character.shooting_cooldown - 1, 0)
-        new_cooldown = jnp.where(
-            fire & (character.shooting_cooldown == 0),
-            self._env.consts.SHOOT_ANIM_FRAMES,
-            decremented,
-        )
 
         return character.replace(
             position=new_position,
             velocity=new_velocity,
             orientation=new_orientation,
             walk_counter=new_walk_counter,
-            shooting_cooldown=new_cooldown,
         )
 
 
@@ -546,11 +557,11 @@ class EnemySpeedUpMod(JaxAtariPostStepModPlugin):
         )
         extra_scale = multiplier - 1.0
 
+        # Zone limits are no longer one offset constant; take the authoritative
+        # per-character bounds (x_min, x_max, y_min, y_max) from the base game.
+        _, _, b_skater, b_goalie = self._env._character_bounds()
         x_min = c.RINK_LEFT
         x_max = c.RINK_RIGHT - c.PLAYER_W
-        y_top = c.RINK_TOP - c.PLAYER_H + 9
-        y_bot = c.RINK_BOTTOM - c.PLAYER_H
-        off = c.ATTACKING_ZONE_OFFSET_Y
 
         def boosted(prev_char, new_char, y_lo, y_hi):
             delta = new_char.position - prev_char.position
@@ -562,14 +573,14 @@ class EnemySpeedUpMod(JaxAtariPostStepModPlugin):
         new_skater = boosted(
             prev_state.enemy_state.skater,
             new_state.enemy_state.skater,
-            y_top,
-            y_bot - off,
+            b_skater[2],
+            b_skater[3],
         )
         new_goalie = boosted(
             prev_state.enemy_state.goalie,
             new_state.enemy_state.goalie,
-            y_top + off,
-            y_bot,
+            b_goalie[2],
+            b_goalie[3],
         )
 
         new_enemy_state = new_state.enemy_state.replace(
