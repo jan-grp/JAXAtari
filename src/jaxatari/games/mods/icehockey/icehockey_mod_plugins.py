@@ -14,11 +14,9 @@ def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
     """Load the icehockey background and close the goal mouths down to [new_x0, new_x1).
 
     The rink is baked into the background sprite: each goal is a black gap in
-    the grey board band (rows PLAYER_GOAL_Y..+GOAL_HEIGHT_TOP at the top,
-    ENEMY_GOAL_Y-GOAL_HEIGHT_BOTTOM+1..ENEMY_GOAL_Y at the bottom, columns
-    GOAL_X0..GOAL_X1). The two goals are not equally deep, so each side uses
-    its own base-game height constant. The now-covered columns are filled with
-    board pixels.
+    the grey board band (rows PLAYER_GOAL_Y..+GOAL_HEIGHT at the top,
+    ENEMY_GOAL_Y-GOAL_HEIGHT+1..ENEMY_GOAL_Y at the bottom, columns
+    GOAL_X0..GOAL_X1). The now-covered columns are filled with board pixels.
     """
     c = IceHockeyConstants()
     sprite_path = os.path.join(
@@ -29,10 +27,8 @@ def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
     )
     bg = np.load(sprite_path).copy()
     board = np.array([192, 192, 192, 255], dtype=np.uint8)
-    top_rows = slice(c.PLAYER_GOAL_Y, c.PLAYER_GOAL_Y + c.GOAL_HEIGHT_TOP)
-    bottom_rows = slice(
-        c.ENEMY_GOAL_Y - c.GOAL_HEIGHT_BOTTOM + 1, c.ENEMY_GOAL_Y + 1
-    )
+    top_rows = slice(c.PLAYER_GOAL_Y, c.PLAYER_GOAL_Y + c.GOAL_HEIGHT)
+    bottom_rows = slice(c.ENEMY_GOAL_Y - c.GOAL_HEIGHT + 1, c.ENEMY_GOAL_Y + 1)
     for rows in (top_rows, bottom_rows):
         bg[rows, c.GOAL_X0 : new_x0] = board
         bg[rows, new_x1 : c.GOAL_X1] = board
@@ -354,10 +350,9 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         # with ice. Measured directly from background.npy: row RINK_TOP-1 and row
         # RINK_BOTTOM are each fully boards-colored across the *entire* rink
         # width (not ice at all), so the true ice band is [RINK_TOP,
-        # RINK_BOTTOM - 1]. The two notches are *not* equally deep: the top one
-        # spans [RINK_TOP, RINK_TOP+GOAL_HEIGHT_TOP) and the bottom one
-        # [RINK_BOTTOM-GOAL_HEIGHT_BOTTOM, RINK_BOTTOM), so each side keeps the
-        # base game's own height constant. Painting ice into row
+        # RINK_BOTTOM - 1] and both notches are exactly GOAL_HEIGHT rows,
+        # symmetric: [RINK_TOP, RINK_TOP+GOAL_HEIGHT) and
+        # [RINK_BOTTOM-GOAL_HEIGHT, RINK_BOTTOM). Painting ice into row
         # RINK_BOTTOM itself (as an earlier version of this code did, based on a
         # single-column measurement that couldn't tell "row is black because of
         # the notch" apart from "row is black everywhere regardless of the
@@ -366,14 +361,14 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         close_positions = jnp.array(
             [
                 [c.GOAL_X0 - 1.0, c.RINK_TOP],
-                [c.GOAL_X0 - 1.0, c.RINK_BOTTOM - c.GOAL_HEIGHT_BOTTOM],
+                [c.GOAL_X0 - 1.0, c.RINK_BOTTOM - c.GOAL_HEIGHT],
             ],
             dtype=jnp.float32,
         )
         close_sizes = jnp.array(
             [
-                [goal_width + 2.0, c.GOAL_HEIGHT_TOP],
-                [goal_width + 2.0, c.GOAL_HEIGHT_BOTTOM],
+                [goal_width + 2.0, c.GOAL_HEIGHT],
+                [goal_width + 2.0, c.GOAL_HEIGHT],
             ],
             dtype=jnp.float32,
         )
@@ -382,20 +377,12 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         # Cut new, smaller notches at each goal's own current dynamic position.
         xs = jnp.stack([top_x0, bottom_x0])
         ys = jnp.array(
-            [float(c.RINK_TOP), float(c.RINK_BOTTOM - c.GOAL_HEIGHT_BOTTOM)],
-            dtype=jnp.float32,
+            [float(c.RINK_TOP), float(c.RINK_BOTTOM - c.GOAL_HEIGHT)], dtype=jnp.float32
         )
         open_positions = jnp.stack([xs, ys], axis=1)
-        open_heights = jnp.array(
-            [float(c.GOAL_HEIGHT_TOP), float(c.GOAL_HEIGHT_BOTTOM)], dtype=jnp.float32
-        )
-        open_sizes = jnp.stack(
-            [
-                jnp.full((2,), float(self.GOAL_WIDTH), dtype=jnp.float32),
-                open_heights,
-            ],
-            axis=1,
-        )
+        open_sizes = jnp.full((2, 2), 0.0, dtype=jnp.float32)
+        open_sizes = open_sizes.at[:, 0].set(float(self.GOAL_WIDTH))
+        open_sizes = open_sizes.at[:, 1].set(float(c.GOAL_HEIGHT))
         raster = jr.draw_rects(raster, open_positions, open_sizes, board_id)
 
         return raster
