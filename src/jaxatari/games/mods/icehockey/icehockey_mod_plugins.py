@@ -226,6 +226,35 @@ def _goal_offset_x(consts, remaining_time, amplitude, speed=0.15):
     )
 
 
+def _moving_post_collision(c, position, velocity, top_x0, bottom_x0, goal_width):
+    """Bounce an already-moved free puck off the posts of the moving goals.
+
+    Same rule as the fixed posts in the base _advance_puck_with_walls: inside the
+    goal-line rows a post (at x0 and x0 + goal_width) only stops a puck entering
+    the mouth from outside, which is then put on the post with its x velocity
+    reversed. The puck physics never sees the game clock that moves the goals, so
+    this runs after the puck has moved and takes position - velocity as the spot
+    it came from.
+    """
+    in_top_band = position[1] <= c.RINK_TOP + c.GOAL_HEIGHT_TOP - 1
+    in_bottom_band = position[1] >= c.RINK_BOTTOM - (c.GOAL_HEIGHT_BOTTOM - 1)
+    x0 = jnp.where(in_top_band, top_x0, bottom_x0)
+    x1 = x0 + goal_width
+
+    x, vx = position[0], velocity[0]
+    came_from = x - vx
+    in_band = in_top_band | in_bottom_band
+    hit_left = in_band & (came_from <= x0) & (x > x0)
+    hit_right = in_band & (came_from >= x1) & (x < x1)
+
+    new_x = jnp.where(hit_left, x0, jnp.where(hit_right, x1, x))
+    new_vx = jnp.where(hit_left | hit_right, -vx, vx)
+    return (
+        jnp.array([new_x, position[1]], dtype=jnp.float32),
+        jnp.array([new_vx, velocity[1]], dtype=jnp.float32),
+    )
+
+
 class ChangeBorderShapeMod(JaxAtariInternalModPlugin):
     """Cuts the four rink corners off diagonally, turning the rink into an octagon.
 
@@ -283,13 +312,25 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
     Both read the same _goal_offset_x(consts, remaining_time, ...) so they can
     never desync.
 
-    Known limitation: the rigid goal posts in _advance_puck_with_walls stay at the
-    fixed GOAL_X0/GOAL_X1, so a puck travelling sideways inside the few goal-line
-    rows can bounce off an invisible post there.
+    The goal posts move along too: _advance_puck_with_walls keeps only the
+    straight boards, and _goal_and_reset_step bounces the puck off the posts at
+    each goal's current position (see _moving_post_collision).
     """
 
     GOAL_WIDTH = 22.0  # smaller than the original GOAL_X1 - GOAL_X0 (32px)
     AMPLITUDE = 32.0  # max distance (px) each goal travels from rink center
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _advance_puck_with_walls(self, position, velocity):
+        # Straight boards only, as in the base game. Its rigid posts sit at the
+        # fixed GOAL_X0/GOAL_X1 and would be invisible walls next to the moving
+        # goals; the moving posts are handled in _goal_and_reset_step.
+        c = self._env.consts
+        tentative = position + velocity
+        low = jnp.array([c.RINK_LEFT, c.RINK_TOP], dtype=jnp.float32)
+        high = jnp.array([c.RINK_RIGHT, c.RINK_BOTTOM], dtype=jnp.float32)
+        hit = (tentative < low) | (tentative > high)
+        return jnp.clip(tentative, low, high), jnp.where(hit, -velocity, velocity)
 
     @partial(jax.jit, static_argnums=(0,))
     def _goal_and_reset_step(
@@ -307,7 +348,25 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
         top_center = mid_x + offset
         bottom_center = mid_x - offset
 
-        puck_pos = puck_state.position
+        # Moving posts first, like the base game resolves its posts before scoring.
+        carried = (
+            player_state.skater.has_puck
+            | player_state.goalie.has_puck
+            | enemy_state.skater.has_puck
+            | enemy_state.goalie.has_puck
+        )
+        free = ~frozen & ~carried
+        post_pos, post_vel = _moving_post_collision(
+            c,
+            puck_state.position,
+            puck_state.velocity,
+            top_center - half_width,
+            bottom_center - half_width,
+            self.GOAL_WIDTH,
+        )
+        puck_pos = jnp.where(free, post_pos, puck_state.position)
+        puck_vel = jnp.where(free, post_vel, puck_state.velocity)
+
         in_top_goal = (jnp.abs(puck_pos[0] - top_center) <= half_width) & (
             puck_pos[1] <= c.PLAYER_GOAL_Y
         )
@@ -333,7 +392,9 @@ class MovingGoalsMod(JaxAtariInternalModPlugin):
             ),
         )
         proxy_pos = jnp.array([base_mouth_x, proxy_y], dtype=jnp.float32)
-        proxy_puck = puck_state.replace(position=jnp.where(frozen, puck_pos, proxy_pos))
+        proxy_puck = puck_state.replace(
+            position=jnp.where(frozen, puck_pos, proxy_pos), velocity=puck_vel
+        )
 
         player_state, enemy_state, new_puck, game_state = type(
             env
