@@ -1918,7 +1918,6 @@ class JaxIceHockey(JaxEnvironment):
     def render(self, state: IceHockeyState) -> jnp.ndarray:
         return self.renderer.render(state)
 
-    @partial(jax.jit, static_argnums=(0,))
     def _get_observation(self, state: IceHockeyState) -> IceHockeyObservation:
         c = self.consts
 
@@ -1970,7 +1969,6 @@ class JaxIceHockey(JaxEnvironment):
             ]
         )
 
-    @partial(jax.jit, static_argnums=(0,))
     def _get_info(self, state: IceHockeyState) -> IceHockeyInfo:
         return IceHockeyInfo(
             player_score=state.game_state.player_score,
@@ -1978,7 +1976,6 @@ class JaxIceHockey(JaxEnvironment):
             remaining_time=state.game_state.remaining_time,
         )
 
-    @partial(jax.jit, static_argnums=(0,))
     def _get_reward(
         self, previous_state: IceHockeyState, state: IceHockeyState
     ) -> chex.Array:
@@ -1990,7 +1987,6 @@ class JaxIceHockey(JaxEnvironment):
         diff = state.game_state.player_score - state.game_state.enemy_score
         return (diff - prev_diff).astype(jnp.float32)
 
-    @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: IceHockeyState) -> chex.Array:
         return state.game_state.is_finished
 
@@ -1998,6 +1994,136 @@ class JaxIceHockey(JaxEnvironment):
 class IceHockeyRenderer(JAXGameRenderer):
     # Palette-based renderer. The rink (boards, lines, goals, score bars) is
     # baked into the background, so render() only stamps the moving objects.
+
+    NUM_CHARACTER_SPRITES = 22  # idle×2 + stand×2 + walk×8 + swing×10
+
+    @staticmethod
+    def _build_character_sprite_table(
+        idle_l: jnp.ndarray,
+        idle_r: jnp.ndarray,
+        stand_l: jnp.ndarray,
+        stand_r: jnp.ndarray,
+        walk_l: jnp.ndarray,
+        walk_r: jnp.ndarray,
+        swing_l: jnp.ndarray,
+        swing_r: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Pack every ordinary character pose into one directly indexable table."""
+        return jnp.stack(
+            [
+                idle_l,
+                idle_r,
+                stand_l,
+                stand_r,
+                walk_l[0],
+                walk_l[1],
+                walk_l[2],
+                walk_l[3],
+                walk_r[0],
+                walk_r[1],
+                walk_r[2],
+                walk_r[3],
+                swing_l[0],
+                swing_l[1],
+                swing_l[2],
+                swing_l[3],
+                swing_l[4],
+                swing_r[0],
+                swing_r[1],
+                swing_r[2],
+                swing_r[3],
+                swing_r[4],
+            ],
+            axis=0,
+        )
+
+    @staticmethod
+    def _character_sprite_index(
+        char: CharacterState,
+        is_active: chex.Array,
+        cadence: int,
+        swing_phase_count: int,
+    ) -> chex.Array:
+        """Return the ordinary-pose table index without rendering branches."""
+        facing_left = char.orientation == 0
+        orient = jnp.where(facing_left, jnp.int32(0), jnp.int32(1))
+
+        idle_idx = orient
+        stand_idx = jnp.int32(2) + orient
+
+        walk_frame = (char.walk_counter // cadence) % 4
+        walk_idx = (
+            jnp.int32(4)
+            + walk_frame
+            + jnp.where(facing_left, jnp.int32(0), jnp.int32(4))
+        )
+
+        # This is exactly the same phase-to-frame mapping as the previous renderer:
+        # phases 1..7 -> swing frames [0, 0, 1, 2, 3, 4, 4].
+        swing_frame = jnp.clip(
+            ((char.swing_phase - 1) * 5) // (swing_phase_count - 1),
+            0,
+            4,
+        )
+        swing_idx = (
+            jnp.int32(12)
+            + swing_frame
+            + jnp.where(facing_left, jnp.int32(0), jnp.int32(5))
+        )
+
+        normal_idx = jnp.where(
+            is_active,
+            jnp.where(char.walk_counter > 0, walk_idx, stand_idx),
+            idle_idx,
+        )
+        # Swing rendering is independent of which teammate is currently active.
+        return jnp.where(char.swing_phase > 0, swing_idx, normal_idx)
+
+    @staticmethod
+    def _goalie_sprite_index(
+        char: CharacterState,
+        is_active: chex.Array,
+        cadence: int,
+        swing_phase_count: int,
+    ) -> chex.Array:
+        base = IceHockeyRenderer._character_sprite_index(
+            char, is_active, cadence, swing_phase_count
+        )
+        # Goalie table: tackled + ordinary poses.
+        return jnp.where(char.is_tackled, jnp.int32(0), base + 1)
+
+    @staticmethod
+    def _skater_sprite_index(
+        char: CharacterState,
+        is_active: chex.Array,
+        is_faceoff: chex.Array,
+        cadence: int,
+        swing_phase_count: int,
+    ) -> chex.Array:
+        base = IceHockeyRenderer._character_sprite_index(
+            char, is_active, cadence, swing_phase_count
+        )
+        # Skater table: tackled + face-off + ordinary poses. This preserves the
+        # previous precedence: tackled > face-off > swing > normal pose.
+        return jnp.where(
+            char.is_tackled,
+            jnp.int32(0),
+            jnp.where(is_faceoff, jnp.int32(1), base + 2),
+        )
+
+    def _stamp_character_sprite(
+        self,
+        raster: jnp.ndarray,
+        char: CharacterState,
+        sprite_table: jnp.ndarray,
+        sprite_idx: chex.Array,
+    ) -> jnp.ndarray:
+        return self.jr.render_at(
+            raster,
+            jnp.round(char.position[0]).astype(jnp.int32),
+            jnp.round(char.position[1]).astype(jnp.int32),
+            sprite_table[sprite_idx],
+        )
 
     def __init__(
         self,
@@ -2027,7 +2153,8 @@ class IceHockeyRenderer(JAXGameRenderer):
         debug_pickup_box = debug_pickup_box.at[-1, :, :].set(debug_red)
         debug_pickup_box = debug_pickup_box.at[:, 0, :].set(debug_red)
         debug_pickup_box = debug_pickup_box.at[:, -1, :].set(debug_red)
-        # colon for the clock, two dots in the blue scoreboard colour
+
+        # Colon for the clock, two dots in the blue scoreboard colour.
         clock_blue = jnp.array([84, 92, 214, 255], dtype=jnp.uint8)
         clock_colon = jnp.zeros((7, 2, 4), dtype=jnp.uint8)
         clock_colon = clock_colon.at[1, :, :].set(clock_blue)
@@ -2051,6 +2178,62 @@ class IceHockeyRenderer(JAXGameRenderer):
             self.FLIP_OFFSETS,
         ) = self.jr.load_and_setup_assets(final_asset_config, self.sprite_path)
 
+        # These tables move sprite-state control flow out of the jitted render graph.
+        self.PLAYER_SPRITE_TABLE = self._build_character_sprite_table(
+            self.SHAPE_MASKS["player_idle_left"],
+            self.SHAPE_MASKS["player_idle_right"],
+            self.SHAPE_MASKS["player_active_standing_left"],
+            self.SHAPE_MASKS["player_active_standing_right"],
+            self.SHAPE_MASKS["player_walking_left"],
+            self.SHAPE_MASKS["player_walking_right"],
+            self.SHAPE_MASKS["player_shooting_left"],
+            self.SHAPE_MASKS["player_shooting_right"],
+        )
+        self.ENEMY_SPRITE_TABLE = self._build_character_sprite_table(
+            self.SHAPE_MASKS["enemy_idle_left"],
+            self.SHAPE_MASKS["enemy_idle_right"],
+            self.SHAPE_MASKS["enemy_active_standing_left"],
+            self.SHAPE_MASKS["enemy_active_standing_right"],
+            self.SHAPE_MASKS["enemy_walking_left"],
+            self.SHAPE_MASKS["enemy_walking_right"],
+            self.SHAPE_MASKS["enemy_shooting_left"],
+            self.SHAPE_MASKS["enemy_shooting_right"],
+        )
+
+        assert self.PLAYER_SPRITE_TABLE.shape[0] == self.NUM_CHARACTER_SPRITES
+        assert self.ENEMY_SPRITE_TABLE.shape[0] == self.NUM_CHARACTER_SPRITES
+
+        self.PLAYER_GOALIE_SPRITE_TABLE = jnp.concatenate(
+            [
+                jnp.expand_dims(self.SHAPE_MASKS["player_tackled"], 0),
+                self.PLAYER_SPRITE_TABLE,
+            ],
+            axis=0,
+        )
+        self.ENEMY_GOALIE_SPRITE_TABLE = jnp.concatenate(
+            [
+                jnp.expand_dims(self.SHAPE_MASKS["enemy_tackled"], 0),
+                self.ENEMY_SPRITE_TABLE,
+            ],
+            axis=0,
+        )
+        self.PLAYER_SKATER_SPRITE_TABLE = jnp.concatenate(
+            [
+                jnp.expand_dims(self.SHAPE_MASKS["player_tackled"], 0),
+                jnp.expand_dims(self.SHAPE_MASKS["player_faceoff"], 0),
+                self.PLAYER_SPRITE_TABLE,
+            ],
+            axis=0,
+        )
+        self.ENEMY_SKATER_SPRITE_TABLE = jnp.concatenate(
+            [
+                jnp.expand_dims(self.SHAPE_MASKS["enemy_tackled"], 0),
+                jnp.expand_dims(self.SHAPE_MASKS["enemy_faceoff"], 0),
+                self.ENEMY_SPRITE_TABLE,
+            ],
+            axis=0,
+        )
+
     @partial(jax.jit, static_argnums=(0,))
     def _render_hook_post_background(
         self, raster: jnp.ndarray, state: IceHockeyState
@@ -2064,31 +2247,10 @@ class IceHockeyRenderer(JAXGameRenderer):
         raster = self._render_hook_post_background(raster, state)
 
         puck_m = self.SHAPE_MASKS["puck"]
-
-        # Skater sprites. Player and enemy walking/standing/idle/shooting poses
-        p_walk_l = self.SHAPE_MASKS["player_walking_left"]
-        p_walk_r = self.SHAPE_MASKS["player_walking_right"]
-        e_walk_l = self.SHAPE_MASKS["enemy_walking_left"]
-        e_walk_r = self.SHAPE_MASKS["enemy_walking_right"]
-        p_idle_l = self.SHAPE_MASKS["player_idle_left"]
-        p_idle_r = self.SHAPE_MASKS["player_idle_right"]
-        e_idle_l = self.SHAPE_MASKS["enemy_idle_left"]
-        e_idle_r = self.SHAPE_MASKS["enemy_idle_right"]
-        p_stand_l = self.SHAPE_MASKS["player_active_standing_left"]
-        p_stand_r = self.SHAPE_MASKS["player_active_standing_right"]
-        e_stand_l = self.SHAPE_MASKS["enemy_active_standing_left"]
-        e_stand_r = self.SHAPE_MASKS["enemy_active_standing_right"]
-        p_faceoff = self.SHAPE_MASKS["player_faceoff"]
-        e_faceoff = self.SHAPE_MASKS["enemy_faceoff"]
-        p_tackled = self.SHAPE_MASKS["player_tackled"]
-        e_tackled = self.SHAPE_MASKS["enemy_tackled"]
-        p_shoot_l = self.SHAPE_MASKS["player_shooting_left"]
-        p_shoot_r = self.SHAPE_MASKS["player_shooting_right"]
-        e_shoot_l = self.SHAPE_MASKS["enemy_shooting_left"]
-        e_shoot_r = self.SHAPE_MASKS["enemy_shooting_right"]
         debug_dot = self.SHAPE_MASKS["debug_position_dot"]
         debug_pickup_box = self.SHAPE_MASKS["debug_pickup_box"]
         cadence = self.consts.ANIM_CADENCE
+        swing_phase_count = self.consts.SWING_PHASE_COUNT
 
         def col(pos):
             return jnp.round(pos[0]).astype(jnp.int32)
@@ -2097,7 +2259,7 @@ class IceHockeyRenderer(JAXGameRenderer):
             return jnp.round(pos[1]).astype(jnp.int32)
 
         def draw_position_dot(r, char):
-            return self.jr.render_at_clipped(
+            return self.jr.render_at(
                 r,
                 col(char.position),
                 row(char.position),
@@ -2114,203 +2276,70 @@ class IceHockeyRenderer(JAXGameRenderer):
 
         def draw_pickup_box(r, char, offset_y):
             box_pos = pickup_box_pos(char, offset_y)
-            return self.jr.render_at_clipped(
+            return self.jr.render_at(
                 r,
                 col(box_pos),
                 row(box_pos),
                 debug_pickup_box,
             )
 
-        def draw_oriented(r, char, left_mask, right_mask):
-            return jax.lax.cond(
-                char.orientation == 0,
-                lambda rr: self.jr.render_at_clipped(
-                    rr,
-                    col(char.position),
-                    row(char.position),
-                    left_mask,
-                ),
-                lambda rr: self.jr.render_at_clipped(
-                    rr,
-                    col(char.position),
-                    row(char.position),
-                    right_mask,
-                ),
-                r,
-            )
-
-        def draw_oriented_frame(r, char, left_masks, right_masks, frame):
-            return jax.lax.cond(
-                char.orientation == 0,
-                lambda rr: self.jr.render_at_clipped(
-                    rr,
-                    col(char.position),
-                    row(char.position),
-                    left_masks[frame],
-                ),
-                lambda rr: self.jr.render_at_clipped(
-                    rr,
-                    col(char.position),
-                    row(char.position),
-                    right_masks[frame],
-                ),
-                r,
-            )
-
-        def draw_player_shooting(r, char, shoot_frame):
-            return jax.lax.cond(
-                char.orientation == 0,
-                lambda rr: self.jr.render_at_clipped(
-                    rr,
-                    col(char.position),
-                    row(char.position),
-                    p_shoot_l[shoot_frame],
-                ),
-                lambda rr: self.jr.render_at_clipped(
-                    rr,
-                    col(char.position),
-                    row(char.position),
-                    p_shoot_r[shoot_frame],
-                ),
-                r,
-            )
-
-        def draw_player(r, char, is_active):
-            frame = (char.walk_counter // cadence) % p_walk_l.shape[0]
-            moving = char.walk_counter > 0
-            shooting = char.swing_phase > 0
-            shoot_frame = jnp.clip(
-                ((char.swing_phase - 1) * p_shoot_l.shape[0])
-                // (self.consts.SWING_PHASE_COUNT - 1),
-                0,
-                p_shoot_l.shape[0] - 1,
-            )
-
-            def draw_normal(rr):
-                return jax.lax.cond(
-                    is_active,
-                    lambda rrr: jax.lax.cond(
-                        moving,
-                        lambda rrrr: draw_oriented_frame(
-                            rrrr, char, p_walk_l, p_walk_r, frame
-                        ),
-                        lambda rrrr: draw_oriented(rrrr, char, p_stand_l, p_stand_r),
-                        rrr,
-                    ),
-                    lambda rrr: draw_oriented(rrr, char, p_idle_l, p_idle_r),
-                    rr,
-                )
-
-            return jax.lax.cond(
-                shooting,
-                lambda rr: draw_player_shooting(rr, char, shoot_frame),
-                draw_normal,
-                r,
-            )
-
-        def draw_enemy(r, char, is_active):
-            frame = (char.walk_counter // cadence) % e_walk_l.shape[0]
-            moving = char.walk_counter > 0
-            shooting = char.swing_phase > 0
-            shoot_frame = jnp.clip(
-                ((char.swing_phase - 1) * e_shoot_l.shape[0])
-                // (self.consts.SWING_PHASE_COUNT - 1),
-                0,
-                e_shoot_l.shape[0] - 1,
-            )
-
-            def draw_normal(rr):
-                return jax.lax.cond(
-                    is_active,
-                    lambda rrr: jax.lax.cond(
-                        moving,
-                        lambda rrrr: draw_oriented_frame(
-                            rrrr, char, e_walk_l, e_walk_r, frame
-                        ),
-                        lambda rrrr: draw_oriented(rrrr, char, e_stand_l, e_stand_r),
-                        rrr,
-                    ),
-                    lambda rrr: draw_oriented(rrr, char, e_idle_l, e_idle_r),
-                    rr,
-                )
-
-            return jax.lax.cond(
-                shooting,
-                lambda rr: draw_oriented_frame(
-                    rr, char, e_shoot_l, e_shoot_r, shoot_frame
-                ),
-                draw_normal,
-                r,
-            )
-
-        def draw_faceoff(r, char, mask):
-            return self.jr.render_at_clipped(
-                r,
-                col(char.position),
-                row(char.position),
-                mask,
-            )
-
-        def draw_tackled(r, char, mask):
-            return self.jr.render_at_clipped(
-                r,
-                col(char.position),
-                row(char.position),
-                mask,
-            )
-
-        def draw_player_with_tackle(r, char, is_active):
-            return jax.lax.cond(
-                char.is_tackled,
-                lambda rr: draw_tackled(rr, char, p_tackled),
-                lambda rr: draw_player(rr, char, is_active),
-                r,
-            )
-
-        def draw_enemy_with_tackle(r, char, is_active):
-            return jax.lax.cond(
-                char.is_tackled,
-                lambda rr: draw_tackled(rr, char, e_tackled),
-                lambda rr: draw_enemy(rr, char, is_active),
-                r,
-            )
-
-        # Active character of each team (0 = skater controlled, 1 = goalie).
         p_act = state.player_state.active_character
         e_act = state.enemy_state.active_character
 
-        # render_at_clipped because skaters can reach the board pixels at the
-        # edge; render_at would slice out of bounds there.
-        raster = draw_player_with_tackle(raster, state.player_state.goalie, p_act == 1)
-        raster = draw_enemy_with_tackle(raster, state.enemy_state.goalie, e_act == 1)
-        raster = jax.lax.cond(
-            state.player_state.skater.is_tackled,
-            lambda r: draw_tackled(r, state.player_state.skater, p_tackled),
-            lambda r: jax.lax.cond(
-                state.game_state.is_faceoff,
-                lambda rr: draw_faceoff(rr, state.player_state.skater, p_faceoff),
-                lambda rr: draw_player(rr, state.player_state.skater, p_act == 0),
-                r,
-            ),
+        raster = self._stamp_character_sprite(
             raster,
-        )
-        raster = jax.lax.cond(
-            state.enemy_state.skater.is_tackled,
-            lambda r: draw_tackled(r, state.enemy_state.skater, e_tackled),
-            lambda r: jax.lax.cond(
-                state.game_state.is_faceoff,
-                lambda rr: draw_faceoff(rr, state.enemy_state.skater, e_faceoff),
-                lambda rr: draw_enemy(rr, state.enemy_state.skater, e_act == 0),
-                r,
+            state.player_state.goalie,
+            self.PLAYER_GOALIE_SPRITE_TABLE,
+            self._goalie_sprite_index(
+                state.player_state.goalie,
+                p_act == 1,
+                cadence,
+                swing_phase_count,
             ),
-            raster,
         )
-        raster = self.jr.render_at_clipped(
+        raster = self._stamp_character_sprite(
+            raster,
+            state.enemy_state.goalie,
+            self.ENEMY_GOALIE_SPRITE_TABLE,
+            self._goalie_sprite_index(
+                state.enemy_state.goalie,
+                e_act == 1,
+                cadence,
+                swing_phase_count,
+            ),
+        )
+        raster = self._stamp_character_sprite(
+            raster,
+            state.player_state.skater,
+            self.PLAYER_SKATER_SPRITE_TABLE,
+            self._skater_sprite_index(
+                state.player_state.skater,
+                p_act == 0,
+                state.game_state.is_faceoff,
+                cadence,
+                swing_phase_count,
+            ),
+        )
+        raster = self._stamp_character_sprite(
+            raster,
+            state.enemy_state.skater,
+            self.ENEMY_SKATER_SPRITE_TABLE,
+            self._skater_sprite_index(
+                state.enemy_state.skater,
+                e_act == 0,
+                state.game_state.is_faceoff,
+                cadence,
+                swing_phase_count,
+            ),
+        )
+
+        raster = self.jr.render_at(
             raster,
             col(state.puck_state.position),
             row(state.puck_state.position),
             puck_m,
         )
+
         if self.consts.DEBUG_RENDER:
             player_offset_y = self.consts.PLAYER_PICKUP_BOX_OFFSET_Y
             enemy_offset_y = self.consts.ENEMY_PICKUP_BOX_OFFSET_Y
@@ -2350,7 +2379,7 @@ class IceHockeyRenderer(JAXGameRenderer):
         raster = self.jr.render_label_selective(
             raster, 65, 5, min_digits, dm_blue, 1, 1, spacing=8, max_digits_to_render=2
         )
-        raster = self.jr.render_at_clipped(
+        raster = self.jr.render_at(
             raster, 75, 5, self.SHAPE_MASKS["clock_colon"]
         )
         raster = self.jr.render_label_selective(
