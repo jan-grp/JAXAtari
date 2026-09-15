@@ -86,15 +86,28 @@ def _make_octagon_background(cut: float) -> np.ndarray:
 
 # --- 1. Individual Mod Plugins ---
 class NoAttackingZonesMod(JaxAtariInternalModPlugin):
-    """Removes the attacking-zone restrictions from the rink.
+    """Removes the attacking zones: every character may skate the whole rink.
 
-    In the base game each character is confined to a horizontal band in front of
-    one goal: _character_bounds derives an upper band and a lower band from
-    CHARACTER_GRID_Y_ORIGIN together with the UPPER/LOWER_CHARACTER_GRID_Y_MIN
-    and _MAX pairs, so a skater is kept out of its own defensive zone and a
-    goalie out of the opponent's far zone. Setting both bands to their union
-    collapses those zones: all four characters may skate everywhere any
-    character could reach in the base game.
+    The base game ties each character to its zone in four places, all lifted here:
+
+    1. Movement bands. _character_bounds derives an upper and a lower band from
+       CHARACTER_GRID_Y_ORIGIN and the UPPER/LOWER_CHARACTER_GRID_Y_MIN/_MAX
+       pairs. Setting both bands to their union lets all four characters reach
+       every spot any character could reach in the base game.
+    2. Teammate spacing. _finalize_character_positions pushes the passive
+       teammate away until the pair is MIN_VERTICAL_DISTANCE apart. With a
+       distance of 0 that check (|dy| < 0) never fires, so teammates may stand
+       side by side or on top of each other.
+    3. Control zones. _resolve_active_characters hands control to the skater or
+       goalie by the puck's zone (ACTIVE_BOTTOM/TOP_THRESHOLD) instead of by
+       distance. Puck grid rows are 0..255, so thresholds of 0 and 256 never
+       match and control always goes to the teammate nearest the puck. On top of
+       that the puck carrier always keeps control, so it can never be left
+       frozen while its teammate is the one being steered.
+    4. Teammate steals. With no spacing, a teammate's pickup box can overlap the
+       carrier's puck and _puck_pickup would let it steal. The patch below keeps
+       the carrier's team out of that check, so only opponents can take a held
+       puck. A free puck (passes, rebounds) can still be collected by anyone.
     """
 
     _BASE = IceHockeyConstants()
@@ -110,7 +123,71 @@ class NoAttackingZonesMod(JaxAtariInternalModPlugin):
         "UPPER_CHARACTER_GRID_Y_MAX": _GRID_Y_MAX,
         "LOWER_CHARACTER_GRID_Y_MIN": _GRID_Y_MIN,
         "LOWER_CHARACTER_GRID_Y_MAX": _GRID_Y_MAX,
+        "MIN_VERTICAL_DISTANCE": 0.0,
+        "ACTIVE_BOTTOM_THRESHOLD": 0,
+        "ACTIVE_TOP_THRESHOLD": 256,
     }
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _resolve_active_characters(self, player_state, enemy_state, puck_position):
+        # Call the class implementation: the instance attribute is this patch.
+        player_active, enemy_active = type(self._env)._resolve_active_characters(
+            self._env, player_state, enemy_state, puck_position
+        )
+
+        def keep_carrier(team, active):
+            # A carrier is never knocked down (_knock_down drops the puck), but
+            # the guard keeps the base rule "a downed character hands over
+            # control" authoritative even so.
+            active = jnp.where(
+                team.skater.has_puck & ~team.skater.is_tackled, jnp.int32(0), active
+            )
+            active = jnp.where(
+                team.goalie.has_puck & ~team.goalie.is_tackled, jnp.int32(1), active
+            )
+            return active.astype(jnp.int32)
+
+        return (
+            keep_carrier(player_state, player_active),
+            keep_carrier(enemy_state, enemy_active),
+        )
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _puck_pickup(self, player_state, enemy_state, puck_state, random_byte):
+        # The base pickup never hands the puck to a knocked-down character, and
+        # is_tackled is read there for nothing else. Marking the team that holds
+        # the puck as knocked down for this one call therefore bars exactly that
+        # team from stealing it, without touching pickups of a free puck or
+        # steals by the opponents. The real is_tackled flags are restored after.
+        def shield(team):
+            team_holds = team.skater.has_puck | team.goalie.has_puck
+            return team.replace(
+                skater=team.skater.replace(
+                    is_tackled=team.skater.is_tackled | team_holds
+                ),
+                goalie=team.goalie.replace(
+                    is_tackled=team.goalie.is_tackled | team_holds
+                ),
+            )
+
+        def restore(result, original):
+            return result.replace(
+                skater=result.skater.replace(is_tackled=original.skater.is_tackled),
+                goalie=result.goalie.replace(is_tackled=original.goalie.is_tackled),
+            )
+
+        new_player, new_enemy, new_puck = type(self._env)._puck_pickup(
+            self._env,
+            shield(player_state),
+            shield(enemy_state),
+            puck_state,
+            random_byte=random_byte,
+        )
+        return (
+            restore(new_player, player_state),
+            restore(new_enemy, enemy_state),
+            new_puck,
+        )
 
 
 class DisableTacklingMod(JaxAtariInternalModPlugin):
