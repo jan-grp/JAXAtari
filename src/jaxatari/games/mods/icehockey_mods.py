@@ -7,6 +7,7 @@ from jaxatari.games.mods.icehockey.icehockey_mod_plugins import (
     PlayerSlidingMod,
     NoAttackingZonesMod,
     DecreasedGoalSizeMod,
+    IncreasedGoalSizeMod,
     DisableTacklingMod,
     TackleSlowdownMod,
 )
@@ -25,6 +26,7 @@ class IceHockeyEnvMod(JaxAtariModController):
         "enemy_speedup_on_goal": EnemySpeedUpMod,
         "no_attacking_zones": NoAttackingZonesMod,
         "decreased_goal_size": DecreasedGoalSizeMod,
+        "increased_goal_size": IncreasedGoalSizeMod,
         "disable_tackling": DisableTacklingMod,
         "tackle_slowdown": TackleSlowdownMod,
     }

@@ -40,22 +40,23 @@ def _rink_corners(c):
     )
 
 
-def _make_narrowed_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
-    """Load the icehockey background and close the goal mouths down to [new_x0, new_x1).
+def _make_resized_goal_background(new_x0: int, new_x1: int) -> np.ndarray:
+    """Load the icehockey background and redraw both goal mouths as [new_x0, new_x1).
 
     The rink is baked into the background sprite: each goal is a black notch in
     the ice (rows PLAYER_GOAL_Y..+GOAL_HEIGHT_TOP at the top,
     ENEMY_GOAL_Y-GOAL_HEIGHT_BOTTOM+1..ENEMY_GOAL_Y at the bottom, columns
     GOAL_X0..GOAL_X1). The two goals are not equally deep, so each side uses its
-    own base-game height constant. The now-covered columns are filled with ice.
+    own base-game height constant. The old notch is filled with ice and the new
+    one cut as boards, so this works for both narrower and wider goals.
     """
     c = IceHockeyConstants()
     bg = _load_base_background()
     top_rows = slice(c.PLAYER_GOAL_Y, c.PLAYER_GOAL_Y + c.GOAL_HEIGHT_TOP)
     bottom_rows = slice(c.ENEMY_GOAL_Y - c.GOAL_HEIGHT_BOTTOM + 1, c.ENEMY_GOAL_Y + 1)
     for rows in (top_rows, bottom_rows):
-        bg[rows, c.GOAL_X0 : new_x0] = _ICE
-        bg[rows, new_x1 : c.GOAL_X1] = _ICE
+        bg[rows, c.GOAL_X0 : c.GOAL_X1] = _ICE
+        bg[rows, new_x0:new_x1] = _BOARDS
     return bg
 
 
@@ -244,7 +245,34 @@ class DecreasedGoalSizeMod(JaxAtariInternalModPlugin):
         "background": {
             "name": "background",
             "type": "background",
-            "data": _make_narrowed_goal_background(_NEW_GOAL_X0, _NEW_GOAL_X1),
+            "data": _make_resized_goal_background(_NEW_GOAL_X0, _NEW_GOAL_X1),
+        }
+    }
+
+
+class IncreasedGoalSizeMod(JaxAtariInternalModPlugin):
+    """Doubles the width of both goals (mouth 64..96 -> 48..112, centred).
+
+    Counterpart to DecreasedGoalSizeMod: GOAL_X0/GOAL_X1 drive goal detection in
+    _goal_and_reset_step and the rigid goal posts in _advance_puck_with_walls, so
+    the wider mouth scores and its posts sit at the new edges. The background
+    asset is rebuilt with the extra goal columns cut in as boards so the visuals
+    match the new geometry. The new mouth keeps 16px of ice to each side board
+    (RINK_LEFT=32, RINK_RIGHT=128) so the posts stay reachable from outside.
+    """
+
+    _NEW_GOAL_X0 = 48
+    _NEW_GOAL_X1 = 112
+
+    constants_overrides = {
+        "GOAL_X0": _NEW_GOAL_X0,
+        "GOAL_X1": _NEW_GOAL_X1,
+    }
+    asset_overrides = {
+        "background": {
+            "name": "background",
+            "type": "background",
+            "data": _make_resized_goal_background(_NEW_GOAL_X0, _NEW_GOAL_X1),
         }
     }
 
