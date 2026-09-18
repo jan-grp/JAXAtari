@@ -1,7 +1,7 @@
 import os
 from jaxatari.modification import JaxAtariModController
 from jaxatari.games.mods.icehockey.icehockey_mod_plugins import (
-    ChangeBorderShapeMod,
+    RoundedCornersMod,
     EnemySpeedUpMod,
     MovingGoalsMod,
     PlayerSlidingMod,
@@ -20,7 +20,7 @@ class IceHockeyEnvMod(JaxAtariModController):
     """
 
     REGISTRY = {
-        "change_border_shape": ChangeBorderShapeMod,
+        "rounded_corners": RoundedCornersMod,
         "moving_goals": MovingGoalsMod,
         "player_sliding": PlayerSlidingMod,
         "enemy_speedup_on_goal": EnemySpeedUpMod,

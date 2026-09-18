@@ -186,7 +186,7 @@ def main() -> None:
         "--mods",
         nargs="*",
         default=None,
-        help="mod keys to apply via jaxatari.core.make, e.g. --mods change_border_shape",
+        help="mod keys to apply via jaxatari.core.make, e.g. --mods rounded_corners",
     )
     parser.add_argument(
         "--fps",

@@ -64,7 +64,7 @@ def _make_octagon_background(cut: float) -> np.ndarray:
     """Load the icehockey background and paint the four corner wedges as boards.
 
     A rink pixel belongs to a wedge when its edge_sum for that corner is below
-    ``cut`` -- exactly where ChangeBorderShapeMod._puck_step pushes the puck out.
+    ``cut`` -- exactly where RoundedCornersMod._puck_step pushes the puck out.
     Generated from the base sprite (instead of shipping a copy) so goal or board
     changes in the base background carry over automatically.
     """
@@ -360,7 +360,7 @@ def _moving_post_collision(c, position, velocity, top_x0, bottom_x0, goal_width)
     )
 
 
-class ChangeBorderShapeMod(JaxAtariInternalModPlugin):
+class RoundedCornersMod(JaxAtariInternalModPlugin):
     """Cuts the four rink corners off diagonally, turning the rink into an octagon.
 
     _puck_step keeps the base physics (friction, straight boards, goal posts) and
